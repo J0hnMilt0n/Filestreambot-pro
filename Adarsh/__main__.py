@@ -36,9 +36,9 @@ async def start_services():
     print("------------------------------ DONE ------------------------------")
     print()
     print(
-        "---------------------- Initializing Clients ----------------------"
+        "---------------------- Starting Clients ----------------------"
     )
-    await initialize_clients()
+    await start_client()
     print("------------------------------ DONE ------------------------------")
     print('\n')
     print('--------------------------- Importing ---------------------------')
