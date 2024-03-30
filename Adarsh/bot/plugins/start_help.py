@@ -125,6 +125,4 @@ async def help_handler(bot, message):
         text="""<b> Send me any file or video i will give you streamable link and download link.</b>\n
 <b> I also support Channels, add me to you Channel and send any media files and see miracle✨ also send /list to know all commands""",
         
-        disable_web_page_preview=True
-        )
     )
