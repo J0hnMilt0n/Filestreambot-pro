@@ -39,10 +39,19 @@ class YouTubeStreamer:
             logger.info("Using YouTube cookies from YOUTUBE_COOKIES env var")
             return self._cookie_temp_file.name
         
-        # Priority 2: Cookie file from env var or default
-        if os.path.exists(self.cookie_file):
-            logger.info("Using YouTube cookies from %s", self.cookie_file)
-            return self.cookie_file
+        # Priority 2: Cookie file from env var or default (only if not invalidated)
+        if self.cookie_file and os.path.exists(self.cookie_file):
+            # Validate cookie file is readable and has content
+            try:
+                with open(self.cookie_file, 'r') as f:
+                    content = f.read().strip()
+                if content:
+                    logger.info("Using YouTube cookies from %s", self.cookie_file)
+                    return self.cookie_file
+                else:
+                    logger.warning("Cookie file %s is empty, ignoring", self.cookie_file)
+            except Exception as e:
+                logger.warning("Cannot read cookie file %s: %s", self.cookie_file, e)
         
         return None
 
@@ -305,6 +314,8 @@ class YouTubeStreamer:
                         cookies_invalid = True
                         # Clear cookie content so _prepare_cookies returns None for future attempts
                         self.cookie_content = None
+                        # Also invalidate cookie file path so it won't be used again
+                        self.cookie_file = None
                         self._cleanup_cookies()
                         logger.warning("Cookies appear invalid, cleared cookies and will skip cookie attempts")
                     
@@ -479,6 +490,8 @@ class YouTubeStreamer:
                             cookies_invalid = True
                             # Clear cookie content so _prepare_cookies returns None for future attempts
                             self.cookie_content = None
+                            # Also invalidate cookie file path so it won't be used again
+                            self.cookie_file = None
                             self._cleanup_cookies()
                             logger.warning("Cookies appear invalid, cleared cookies and will skip cookie attempts")
                         
