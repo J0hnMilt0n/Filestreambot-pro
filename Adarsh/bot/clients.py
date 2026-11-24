@@ -27,23 +27,38 @@ from Adarsh.utils.config_parser import TokenParser
 from Adarsh.bot import multi_clients, work_loads, StreamBot
 
 
-def create_client(session):
-    return TelegramClient(
-        session,
-        Var.API_ID,
-        Var.API_HASH,
-        connection=TelethonFakeTLS.ConnectionTcpMTProxyFakeTLS,
-        proxy=(
-            Var.TELEGRAM_PROXY_HOST,
-            Var.TELEGRAM_PROXY_PORT,
-            Var.TELEGRAM_PROXY_SECRET[2:]
-        ),
-        request_retries=2,
-        connection_retries=5,
-        retry_delay=5,
-        flood_sleep_threshold=Var.SLEEP_THRESHOLD,
-        receive_updates=False
-    )
+def create_client(session, use_proxy=True):
+    """Create Telegram client with optional proxy fallback."""
+    if use_proxy and Var.TELEGRAM_PROXY_HOST and Var.TELEGRAM_PROXY_SECRET:
+        logging.info("Creating client with MTProto proxy: %s:%s", Var.TELEGRAM_PROXY_HOST, Var.TELEGRAM_PROXY_PORT)
+        return TelegramClient(
+            session,
+            Var.API_ID,
+            Var.API_HASH,
+            connection=TelethonFakeTLS.ConnectionTcpMTProxyFakeTLS,
+            proxy=(
+                Var.TELEGRAM_PROXY_HOST,
+                Var.TELEGRAM_PROXY_PORT,
+                Var.TELEGRAM_PROXY_SECRET[2:]
+            ),
+            request_retries=2,
+            connection_retries=5,
+            retry_delay=5,
+            flood_sleep_threshold=Var.SLEEP_THRESHOLD,
+            receive_updates=False
+        )
+    else:
+        logging.info("Creating client with DIRECT connection (no proxy)")
+        return TelegramClient(
+            session,
+            Var.API_ID,
+            Var.API_HASH,
+            request_retries=2,
+            connection_retries=5,
+            retry_delay=5,
+            flood_sleep_threshold=Var.SLEEP_THRESHOLD,
+            receive_updates=False
+        )
 
 
 def is_telegram_internal_error(error):
@@ -71,18 +86,32 @@ async def initialize_clients():
     multi_clients.clear()
     work_loads.clear()
 
-    # Start main bot (single attempt - retries handled by caller)
-    if not StreamBot.is_connected():
+    # Start main bot with proxy fallback
+    global StreamBot
+    from Adarsh.bot import StreamBot as BotInstance
+    
+    # Try with proxy first, then direct connection
+    for use_proxy in [True, False]:
+        if not use_proxy:
+            logging.warning("Proxy failed, falling back to DIRECT connection...")
+        
+        # Recreate StreamBot with appropriate connection
+        StreamBot = create_client(MemorySession(), use_proxy=use_proxy)
+        multi_clients[0] = StreamBot
+        
         try:
-            logging.info("Starting main bot...")
+            logging.info("Starting main bot (proxy=%s)...", use_proxy)
             await StreamBot.start(bot_token=Var.BOT_TOKEN)
-            logging.info("Main bot started successfully")
+            logging.info("Main bot started successfully with %s", "proxy" if use_proxy else "direct connection")
+            break
         except Exception as e:
-            logging.warning("Main bot startup failed: %s", e)
-            await StreamBot.disconnect()
-            raise
-
-    multi_clients[0] = StreamBot
+            logging.warning("Main bot startup failed (proxy=%s): %s", use_proxy, e)
+            try:
+                await StreamBot.disconnect()
+            except Exception:
+                pass
+            if not use_proxy:
+                raise  # Both proxy and direct failed
     work_loads[0] = 0
 
     # Additional bot clients
@@ -99,21 +128,30 @@ async def initialize_clients():
 
         client = None
 
-        try:
-            logging.info("Starting client %s...", client_id)
-            client = create_client(MemorySession())
-            await client.start(bot_token=token)
-            multi_clients[client_id] = client
-            work_loads[client_id] = 0
-            started += 1
-            logging.info("Client %s started successfully", client_id)
-            client = None
-        except Exception as e:
-            logging.warning("Client %s failed: %s", client_id, e)
-            if client is not None:
-                try:
-                    await client.disconnect()
-                except Exception:
+        # Try with proxy first, then direct connection
+        for use_proxy in [True, False]:
+            if not use_proxy:
+                logging.warning("Client %s: Proxy failed, falling back to DIRECT connection...", client_id)
+            
+            try:
+                logging.info("Starting client %s (proxy=%s)...", client_id, use_proxy)
+                client = create_client(MemorySession(), use_proxy=use_proxy)
+                await client.start(bot_token=token)
+                multi_clients[client_id] = client
+                work_loads[client_id] = 0
+                started += 1
+                logging.info("Client %s started successfully with %s", client_id, "proxy" if use_proxy else "direct connection")
+                client = None
+                break
+            except Exception as e:
+                logging.warning("Client %s failed (proxy=%s): %s", client_id, use_proxy, e)
+                if client is not None:
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
+                if not use_proxy:
+                    # Both proxy and direct failed
                     pass
 
         await asyncio.sleep(3)

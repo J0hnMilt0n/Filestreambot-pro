@@ -4,6 +4,7 @@
 import logging
 
 from telethon import TelegramClient
+from telethon.sessions import MemorySession
 import TelethonFakeTLS
 
 from Adarsh.vars import Var
@@ -17,17 +18,11 @@ logging.basicConfig(
 multi_clients = {}
 work_loads = {}
 
-# Create main Telegram client
+# Create main Telegram client (will use proxy fallback in initialize_clients)
 StreamBot = TelegramClient(
-    "Web Streamer",
+    MemorySession(),
     Var.API_ID,
     Var.API_HASH,
-    connection=TelethonFakeTLS.ConnectionTcpMTProxyFakeTLS,
-    proxy=(
-        Var.TELEGRAM_PROXY_HOST,
-        Var.TELEGRAM_PROXY_PORT,
-        Var.TELEGRAM_PROXY_SECRET[2:]
-    ),
     request_retries=2,
     connection_retries=5,
     retry_delay=5
