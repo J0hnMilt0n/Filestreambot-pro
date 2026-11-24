@@ -356,7 +356,10 @@ class YouTubeStreamer:
                     logger.warning("Video info failed (client: %s, cookies: %s): %s", player_client, use_cookies, stderr_str)
                     
                     # Detect invalid cookies - stop using them
-                    if "sign in to confirm" in stderr_str.lower() or "not a bot" in stderr_str.lower() or "skipping cookie file entry due to invalid length" in stderr_str.lower():
+                    if ("sign in to confirm" in stderr_str.lower() 
+                        or "not a bot" in stderr_str.lower() 
+                        or "please sign in" in stderr_str.lower()
+                        or "skipping cookie file entry due to invalid length" in stderr_str.lower()):
                         cookies_invalid = True
                         # Clear cookie content so _prepare_cookies returns None for future attempts
                         self.cookie_content = None
@@ -542,7 +545,10 @@ class YouTubeStreamer:
                         logger.warning("Format %s (client: %s, cookies: %s) failed: %s", fmt, player_client, use_cookies, stderr_str)
                         
                         # Detect invalid cookies - stop using them
-                        if "sign in to confirm" in stderr_str.lower() or "not a bot" in stderr_str.lower() or "skipping cookie file entry due to invalid length" in stderr_str.lower():
+                        if ("sign in to confirm" in stderr_str.lower() 
+                            or "not a bot" in stderr_str.lower() 
+                            or "please sign in" in stderr_str.lower()
+                            or "skipping cookie file entry due to invalid length" in stderr_str.lower()):
                             cookies_invalid = True
                             # Clear cookie content so _prepare_cookies returns None for future attempts
                             self.cookie_content = None
