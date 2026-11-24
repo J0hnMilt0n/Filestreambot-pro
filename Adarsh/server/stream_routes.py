@@ -213,10 +213,7 @@ async def media_streamer(
             text="Streaming workers unavailable"
         )
 
-    index = min(
-        range(len(work_loads)),
-        key=lambda i: work_loads[i]
-    )
+    index = min(work_loads, key=work_loads.get)
 
     faster_client = multi_clients[index]
 

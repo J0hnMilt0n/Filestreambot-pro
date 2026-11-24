@@ -409,7 +409,8 @@ class ByteStreamer:
 
             await asyncio.sleep(self.clean_timer)
 
-            self.cached_file_ids.clear()
+            async with self._cache_lock:
+                self.cached_file_ids.clear()
 
             logging.debug(
                 "Cleaned file properties cache"

@@ -23,12 +23,10 @@ StreamBot = Client(
     max_concurrent_transmissions=4
 )
 
-# Client management
 multi_clients = {
     0: StreamBot
 }
 
-# Workload tracking
 work_loads = {
     0: 0
 }
