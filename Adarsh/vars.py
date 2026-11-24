@@ -2,6 +2,7 @@
 # (c) adarsh-goel
 
 import os
+import logging
 from os import getenv, environ
 from dotenv import load_dotenv
 
@@ -55,8 +56,10 @@ class Var(object):
     OWNER_USERNAME = getenv("OWNER_USERNAME", "")
 
     ON_HEROKU = "DYNO" in environ
+    ON_KOYEB = "KOYEB_APP_NAME" in environ or "KOYEB_SERVICE_NAME" in environ
 
     APP_NAME = getenv("APP_NAME", "") if ON_HEROKU else None
+    KOYEB_APP_NAME = getenv("KOYEB_APP_NAME", "") if ON_KOYEB else None
 
     HAS_SSL = get_bool("HAS_SSL", True)
 
@@ -65,10 +68,13 @@ class Var(object):
     if not FQDN and ON_HEROKU and APP_NAME:
         FQDN = f"{APP_NAME}.herokuapp.com"
 
+    if not FQDN and ON_KOYEB and KOYEB_APP_NAME:
+        FQDN = f"{KOYEB_APP_NAME}.koyeb.app"
+
     if not FQDN:
-        raise ValueError(
-            "FQDN is missing! Set FQDN to your public domain name."
-        )
+        # Default to localhost for local dev, but warn
+        FQDN = "localhost"
+        logging.warning("FQDN not set, defaulting to localhost. Set FQDN env var for production.")
 
     FQDN = (
         FQDN.replace("https://", "")

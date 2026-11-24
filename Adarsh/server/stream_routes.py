@@ -259,14 +259,15 @@ async def media_streamer(request):
     except asyncio.CancelledError:
         raise
 
-    except Exception:
-        logger.exception("File streaming failed")
+    except Exception as e:
+        logger.exception("File streaming failed: %s", e)
 
         if not request.transport or request.transport.is_closing():
             return web.Response(status=500)
 
+        # Return actual error for debugging (remove in production)
         return web.Response(
-            text="Internal streaming error",
+            text=f"Internal streaming error: {type(e).__name__}: {e}",
             status=500
         )
 async def health_check(request):

@@ -48,9 +48,21 @@ def create_client(session):
 
 def is_telegram_internal_error(error):
     """Check if the error is a transient Telegram internal issue."""
+    error_msg = str(error).lower()
+    # Check for Telegram internal issues in any exception message
+    if "telegram is having internal issues" in error_msg:
+        return True
+    # Also check for RpcCallFailError specifically
     if isinstance(error, RpcCallFailError):
-        error_msg = str(error).lower()
         return "telegram is having internal issues" in error_msg
+    # Check common Telegram error patterns
+    if any(keyword in error_msg for keyword in [
+        "internal issues",
+        "try again later",
+        "rpc call fail",
+        "importbotauthorizationrequest",
+    ]):
+        return True
     return False
 
 
@@ -59,43 +71,16 @@ async def initialize_clients():
     multi_clients.clear()
     work_loads.clear()
 
-    # Start main bot
+    # Start main bot (single attempt - retries handled by caller)
     if not StreamBot.is_connected():
-        for attempt in range(1, 6):
-            try:
-                logging.info(
-                    "Starting main bot (attempt %s/5)",
-                    attempt
-                )
-
-                await StreamBot.start(
-                    bot_token=Var.BOT_TOKEN
-                )
-
-                logging.info("Main bot started successfully")
-                break
-
-            except Exception as e:
-                logging.warning(
-                    "Main bot startup failed: %s", e
-                )
-
-                await StreamBot.disconnect()
-
-                if attempt == 5:
-                    raise
-
-                # Use longer delay for Telegram internal issues
-                if is_telegram_internal_error(e):
-                    delay = min(30 * (2 ** (attempt - 1)), 120)
-                    logging.info(
-                        "Telegram internal issue detected, waiting %ss before retry",
-                        delay
-                    )
-                else:
-                    delay = min(5 * (2 ** (attempt - 1)), 60)
-                
-                await asyncio.sleep(delay)
+        try:
+            logging.info("Starting main bot...")
+            await StreamBot.start(bot_token=Var.BOT_TOKEN)
+            logging.info("Main bot started successfully")
+        except Exception as e:
+            logging.warning("Main bot startup failed: %s", e)
+            await StreamBot.disconnect()
+            raise
 
     multi_clients[0] = StreamBot
     work_loads[0] = 0
@@ -114,59 +99,22 @@ async def initialize_clients():
 
         client = None
 
-        for attempt in range(1, 6):
-
-            try:
-                logging.info(
-                    "Starting client %s (attempt %s/5)",
-                    client_id,
-                    attempt
-                )
-
-                client = create_client(MemorySession())
-
-                await client.start(bot_token=token)
-
-                multi_clients[client_id] = client
-                work_loads[client_id] = 0
-
-                started += 1
-
-                logging.info(
-                    "Client %s started successfully",
-                    client_id
-                )
-
-                client = None
-                break
-
-            except Exception as e:
-
-                logging.warning(
-                    "Client %s failed (attempt %s/5): %s",
-                    client_id,
-                    attempt,
-                    e
-                )
-
-                if client is not None:
-                    try:
-                        await client.disconnect()
-                    except Exception:
-                        pass
-
-                if attempt < 5:
-                    # Use longer delay for Telegram internal issues
-                    if is_telegram_internal_error(e):
-                        delay = min(30 * (2 ** (attempt - 1)), 120)
-                        logging.info(
-                            "Telegram internal issue detected, waiting %ss before retry",
-                            delay
-                        )
-                    else:
-                        delay = min(5 * (2 ** (attempt - 1)), 60)
-                    
-                    await asyncio.sleep(delay)
+        try:
+            logging.info("Starting client %s...", client_id)
+            client = create_client(MemorySession())
+            await client.start(bot_token=token)
+            multi_clients[client_id] = client
+            work_loads[client_id] = 0
+            started += 1
+            logging.info("Client %s started successfully", client_id)
+            client = None
+        except Exception as e:
+            logging.warning("Client %s failed: %s", client_id, e)
+            if client is not None:
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
 
         await asyncio.sleep(3)
 
