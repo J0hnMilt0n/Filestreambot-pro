@@ -20,6 +20,38 @@ class YouTubeStreamer:
         self._has_ffmpeg = False
         # Cookie file for YouTube authentication (optional)
         self.cookie_file = os.getenv("YOUTUBE_COOKIES_FILE", "/tmp/youtube_cookies.txt")
+        # Cookie content from env var (alternative to file)
+        self.cookie_content = os.getenv("YOUTUBE_COOKIES")
+        self._cookie_temp_file = None
+
+    def _prepare_cookies(self) -> Optional[str]:
+        """Prepare cookie file from env var or existing file. Returns path or None."""
+        # Priority 1: Cookie content from env var (write to temp file)
+        if self.cookie_content:
+            import tempfile
+            self._cookie_temp_file = tempfile.NamedTemporaryFile(
+                mode='w', suffix='.txt', delete=False, prefix='yt_cookies_'
+            )
+            self._cookie_temp_file.write(self.cookie_content)
+            self._cookie_temp_file.close()
+            logger.info("Using YouTube cookies from YOUTUBE_COOKIES env var")
+            return self._cookie_temp_file.name
+        
+        # Priority 2: Cookie file from env var or default
+        if os.path.exists(self.cookie_file):
+            logger.info("Using YouTube cookies from %s", self.cookie_file)
+            return self.cookie_file
+        
+        return None
+
+    def _cleanup_cookies(self):
+        """Clean up temporary cookie file."""
+        if self._cookie_temp_file and os.path.exists(self._cookie_temp_file.name):
+            try:
+                os.unlink(self._cookie_temp_file.name)
+            except Exception:
+                pass
+            self._cookie_temp_file = None
 
     def _get_base_cmd(self):
         """Base yt-dlp command with anti-bot options."""
@@ -36,13 +68,10 @@ class YouTubeStreamer:
             "--add-header", "Accept-Language:en-US,en;q=0.9",
         ]
         
-        # Add cookies if file exists
-        # Note: On Windows, Chrome cookies are encrypted with DPAPI and can't be read by yt-dlp directly.
-        # Use Firefox instead: yt-dlp --cookies-from-browser firefox -o /dev/null "URL"
-        # Or export cookies manually via browser extension "Get cookies.txt LOCALLY"
-        if os.path.exists(self.cookie_file):
-            cmd.extend(["--cookies", self.cookie_file])
-            logger.info("Using YouTube cookies from %s", self.cookie_file)
+        # Add cookies from env var or file
+        cookie_path = self._prepare_cookies()
+        if cookie_path:
+            cmd.extend(["--cookies", cookie_path])
         
         return cmd
 
@@ -124,6 +153,7 @@ class YouTubeStreamer:
                     urls = stdout.decode().strip().split('\n')
                     if urls and urls[0]:
                         logger.info("Got stream URL with format: %s", fmt)
+                        self._cleanup_cookies()
                         return urls[0]
                 
                 last_error = stderr.decode()
@@ -133,6 +163,7 @@ class YouTubeStreamer:
                 last_error = str(e)
                 logger.warning("Format %s exception: %s", fmt, e)
         
+        self._cleanup_cookies()
         raise Exception(f"All format attempts failed. Last error: {last_error}")
 
     async def stream_video(
@@ -145,34 +176,57 @@ class YouTubeStreamer:
     ) -> AsyncGenerator[bytes, None]:
         """Stream video content by proxying direct URL from yt-dlp."""
         
-        # Get direct stream URL
-        stream_url = await self.get_stream_url(url, quality)
-        if not stream_url:
-            raise Exception("No stream URL found")
-        
-        logger.info("Streaming YouTube video via direct URL: %s...", stream_url[:50])
-        
-        # Use aiohttp to proxy the stream
-        import aiohttp
-        
-        headers = {}
-        if start or end:
-            range_val = f"bytes={start}-"
-            if end:
-                range_val += str(end)
-            headers["Range"] = range_val
-        
-        timeout = aiohttp.ClientTimeout(total=300, connect=30)
-        
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(stream_url, headers=headers) as resp:
-                if resp.status not in (200, 206):
-                    raise Exception(f"Stream request failed: {resp.status}")
-                
-                async for chunk in resp.content.iter_chunked(chunk_size):
-                    if not chunk:
-                        continue
-                    yield chunk
+        try:
+            # Get direct stream URL
+            stream_url = await self.get_stream_url(url, quality)
+            if not stream_url:
+                raise Exception("No stream URL found")
+            
+            logger.info("Streaming YouTube video via direct URL: %s...", stream_url[:50])
+            
+            # Use aiohttp to proxy the stream with same headers/cookies as yt-dlp
+            import aiohttp
+            
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Referer": "https://www.youtube.com/",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Origin": "https://www.youtube.com",
+            }
+            if start or end:
+                range_val = f"bytes={start}-"
+                if end:
+                    range_val += str(end)
+                headers["Range"] = range_val
+            
+            # Prepare cookies for the streaming request
+            cookie_path = self._prepare_cookies()
+            cookie_jar = None
+            if cookie_path:
+                import http.cookiejar
+                cookie_jar = http.cookiejar.MozillaCookieJar(cookie_path)
+                cookie_jar.load(ignore_discard=True, ignore_expires=True)
+            
+            timeout = aiohttp.ClientTimeout(total=300, connect=30)
+            
+            connector = aiohttp.TCPConnector(limit=10)
+            async with aiohttp.ClientSession(
+                timeout=timeout,
+                connector=connector,
+                cookie_jar=cookie_jar
+            ) as session:
+                async with session.get(stream_url, headers=headers) as resp:
+                    if resp.status not in (200, 206):
+                        # Log response headers for debugging
+                        logger.error("Stream request failed: %s, headers: %s", resp.status, dict(resp.headers))
+                        raise Exception(f"Stream request failed: {resp.status}")
+                    
+                    async for chunk in resp.content.iter_chunked(chunk_size):
+                        if not chunk:
+                            continue
+                        yield chunk
+        finally:
+            self._cleanup_cookies()
 
 
 async def get_youtube_streamer() -> YouTubeStreamer:
