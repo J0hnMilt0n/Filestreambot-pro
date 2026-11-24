@@ -166,14 +166,25 @@ class YouTubeStreamer:
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE
                 )
-                stdout, stderr = await proc.communicate()
+                # Add timeout to prevent hanging
+                try:
+                    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30.0)
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    await proc.communicate()
+                    logger.warning("Video info timeout (client: %s)", player_client)
+                    continue
                 
                 if proc.returncode == 0:
-                    import json
-                    info = json.loads(stdout.decode())
-                    logger.info("Got video info with player_client: %s", player_client)
-                    self._cleanup_cookies()
-                    return info
+                    stdout_str = stdout.decode().strip()
+                    if stdout_str:
+                        import json
+                        info = json.loads(stdout_str)
+                        logger.info("Got video info with player_client: %s", player_client)
+                        self._cleanup_cookies()
+                        return info
+                    else:
+                        logger.warning("Video info empty output (client: %s)", player_client)
                 
                 last_error = stderr.decode()
                 logger.warning("Video info failed (client: %s): %s", player_client, last_error[:200])
@@ -204,16 +215,24 @@ class YouTubeStreamer:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE
             )
-            stdout, stderr = await proc.communicate()
-            
-            if proc.returncode == 0:
-                import json
-                info = json.loads(stdout.decode())
-                logger.info("Got video info with basic command")
-                self._cleanup_cookies()
-                return info
-            
-            last_error = stderr.decode()
+            try:
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30.0)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.communicate()
+                logger.warning("Basic video info timeout")
+                last_error = "timeout"
+            else:
+                if proc.returncode == 0:
+                    stdout_str = stdout.decode().strip()
+                    if stdout_str:
+                        import json
+                        info = json.loads(stdout_str)
+                        logger.info("Got video info with basic command")
+                        self._cleanup_cookies()
+                        return info
+                
+                last_error = stderr.decode()
         except Exception as e:
             last_error = str(e)
         
@@ -223,7 +242,6 @@ class YouTubeStreamer:
             "https://yewtu.be",
             "https://invidious.snopyta.org",
             "https://invidious.nerdvpn.de",
-            "https://yewtu.be",
         ]
         
         video_id = url.split("v=")[-1].split("&")[0]
@@ -319,7 +337,14 @@ class YouTubeStreamer:
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE
                     )
-                    stdout, stderr = await proc.communicate()
+                    # Add timeout to prevent hanging
+                    try:
+                        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30.0)
+                    except asyncio.TimeoutError:
+                        proc.kill()
+                        await proc.communicate()
+                        logger.warning("Format %s (client: %s) timeout", fmt, player_client)
+                        continue
                     
                     if proc.returncode == 0:
                         urls = stdout.decode().strip().split('\n')
@@ -344,8 +369,14 @@ class YouTubeStreamer:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE
             )
-            stdout, stderr = await proc.communicate()
-            logger.info("Available formats for %s:\n%s", url, stdout.decode()[:2000])
+            try:
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30.0)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.communicate()
+                logger.warning("List formats timeout")
+            else:
+                logger.info("Available formats for %s:\n%s", url, stdout.decode()[:2000])
         except Exception as e:
             logger.warning("Failed to list formats: %s", e)
         
@@ -430,7 +461,7 @@ class YouTubeStreamer:
                 cookie_jar = http.cookiejar.MozillaCookieJar(cookie_path)
                 cookie_jar.load(ignore_discard=True, ignore_expires=True)
             
-            timeout = aiohttp.ClientTimeout(total=300, connect=30)
+            timeout = aiohttp.ClientTimeout(total=300, connect=30, sock_read=30)
             
             connector = aiohttp.TCPConnector(limit=10)
             async with aiohttp.ClientSession(
@@ -452,7 +483,8 @@ class YouTubeStreamer:
                             if resp2.status not in (200, 206):
                                 logger.error("Retry failed: %s", resp2.status)
                                 raise Exception(f"Stream request failed: {resp2.status}")
-                            async for chunk in resp2.content.iter_chunked(chunk_size):
+                            # Add timeout for chunk reading
+                            async for chunk in self._iter_chunks_with_timeout(resp2.content, chunk_size, 30.0):
                                 if not chunk:
                                     continue
                                 yield chunk
@@ -462,12 +494,25 @@ class YouTubeStreamer:
                         logger.error("Stream request failed: %s, headers: %s", resp.status, dict(resp.headers))
                         raise Exception(f"Stream request failed: {resp.status}")
                     
-                    async for chunk in resp.content.iter_chunked(chunk_size):
+                    # Add timeout for chunk reading
+                    async for chunk in self._iter_chunks_with_timeout(resp.content, chunk_size, 30.0):
                         if not chunk:
                             continue
                         yield chunk
         finally:
             self._cleanup_cookies()
+
+    async def _iter_chunks_with_timeout(self, content, chunk_size: int, timeout: float):
+        """Iterate chunks with per-chunk timeout to prevent infinite hanging."""
+        while True:
+            try:
+                chunk = await asyncio.wait_for(content.read(chunk_size), timeout=timeout)
+            except asyncio.TimeoutError:
+                logger.warning("Chunk read timeout, stopping stream")
+                break
+            if not chunk:
+                break
+            yield chunk
 
 
 async def get_youtube_streamer() -> YouTubeStreamer:
