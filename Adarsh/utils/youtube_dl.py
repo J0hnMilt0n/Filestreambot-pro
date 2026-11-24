@@ -18,11 +18,15 @@ class YouTubeStreamer:
         self.yt_dlp_path = "yt-dlp"
         self._ffmpeg_checked = False
         self._has_ffmpeg = False
+        self._deno_checked = False
+        self._has_deno = False
         # Cookie file for YouTube authentication (optional)
         self.cookie_file = os.getenv("YOUTUBE_COOKIES_FILE", "/tmp/youtube_cookies.txt")
         # Cookie content from env var (alternative to file)
         self.cookie_content = os.getenv("YOUTUBE_COOKIES")
         self._cookie_temp_file = None
+        # Cookie invalidation state (persists across method calls)
+        self._cookies_invalidated = False
         # Cache for video info to avoid duplicate calls
         self._info_cache: Dict[str, Dict[str, Any]] = {}
 
@@ -303,7 +307,7 @@ class YouTubeStreamer:
                 cmd, env = self._get_base_cmd()
                 
                 # Remove cookies if not using them OR if cookies are invalid
-                if not use_cookies or cookies_invalid:
+                if not use_cookies or self._cookies_invalidated:
                     try:
                         idx = cmd.index("--cookies")
                         cmd.pop(idx)
@@ -360,7 +364,7 @@ class YouTubeStreamer:
                         or "not a bot" in stderr_str.lower() 
                         or "please sign in" in stderr_str.lower()
                         or "skipping cookie file entry due to invalid length" in stderr_str.lower()):
-                        cookies_invalid = True
+                        self._cookies_invalidated = True
                         # Clear cookie content so _prepare_cookies returns None for future attempts
                         self.cookie_content = None
                         # Also invalidate cookie file path so it won't be used again
@@ -482,8 +486,8 @@ class YouTubeStreamer:
             "best",
         ]
         
-        # Track if cookies are invalid to avoid retrying with them
-        cookies_invalid = False
+        # Track if cookies are invalid to avoid retrying with them (instance variable)
+        # self._cookies_invalidated is set when bot detection/format errors occur
         
         # Try with cookies first, then without cookies
         for use_cookies in [True, False]:
@@ -495,7 +499,7 @@ class YouTubeStreamer:
                     cmd, env = self._get_base_cmd()
                     
                     # Remove cookies if not using them OR if cookies are invalid
-                    if not use_cookies or cookies_invalid:
+                    if not use_cookies or self._cookies_invalidated:
                         try:
                             idx = cmd.index("--cookies")
                             cmd.pop(idx)
@@ -549,7 +553,7 @@ class YouTubeStreamer:
                             or "not a bot" in stderr_str.lower() 
                             or "please sign in" in stderr_str.lower()
                             or "skipping cookie file entry due to invalid length" in stderr_str.lower()):
-                            cookies_invalid = True
+                            self._cookies_invalidated = True
                             # Clear cookie content so _prepare_cookies returns None for future attempts
                             self.cookie_content = None
                             # Also invalidate cookie file path so it won't be used again
@@ -672,6 +676,12 @@ class YouTubeStreamer:
             yield chunk
 
 
+# Module-level singleton instance
+_youtube_streamer_instance: Optional[YouTubeStreamer] = None
+
 async def get_youtube_streamer() -> YouTubeStreamer:
-    """Get or create YouTube streamer instance."""
-    return YouTubeStreamer()
+    """Get or create YouTube streamer instance (singleton)."""
+    global _youtube_streamer_instance
+    if _youtube_streamer_instance is None:
+        _youtube_streamer_instance = YouTubeStreamer()
+    return _youtube_streamer_instance
