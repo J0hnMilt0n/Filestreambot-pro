@@ -1,23 +1,19 @@
 
 # (c) adarsh-goel
 
-import os
 import sys
-import glob
 import asyncio
 import logging
 import importlib.util
 
 from pathlib import Path
-from pyrogram import idle
-from pyrogram.errors import RPCError
 from aiohttp import web
 
-from .bot import StreamBot
+from .bot import StreamBot, multi_clients, work_loads
+from .bot.clients import initialize_clients
 from .vars import Var
 from .server import web_server
 from .utils.keepalive import ping_server
-from Adarsh.bot.clients import initialize_clients
 
 
 logging.basicConfig(
@@ -26,54 +22,12 @@ logging.basicConfig(
 )
 
 logging.getLogger("aiohttp").setLevel(logging.ERROR)
-logging.getLogger("pyrogram").setLevel(logging.ERROR)
 logging.getLogger("aiohttp.web").setLevel(logging.ERROR)
+logging.getLogger("telethon").setLevel(logging.INFO)
 
 logging.info("Starting DL Upload Host...")
 
-
-# Plugin directory
 PLUGIN_DIR = Path(__file__).resolve().parent / "bot" / "plugins"
-
-
-async def start_bot():
-    """Start Telegram bot with limited retries."""
-
-    for attempt in range(1, 6):
-        try:
-            logging.info(
-                f"Starting Telegram bot (attempt {attempt}/5)"
-            )
-
-            await StreamBot.start()
-
-            logging.info("Telegram bot started successfully")
-            return
-
-        except Exception as e:
-            error_text = str(e).lower()
-            error_code = getattr(e, "CODE", None)
-
-            temporary_error = (
-                isinstance(e, (asyncio.TimeoutError, OSError))
-                or (isinstance(e, RPCError) and error_code is not None
-                    and error_code >= 500)
-                or "timeout" in error_text
-                or "rpc_call_fail" in error_text
-            )
-
-            if not temporary_error or attempt == 5:
-                logging.exception("Telegram bot startup failed")
-                raise
-
-            wait_time = attempt * 5
-
-            logging.warning(
-                f"Temporary Telegram error: {e}. "
-                f"Retrying in {wait_time} seconds..."
-            )
-
-            await asyncio.sleep(wait_time)
 
 
 async def load_plugins():
@@ -117,7 +71,8 @@ async def load_plugins():
 
         except Exception:
             logging.exception(
-                f"Failed to load plugin: {plugin_name}"
+                "Failed to load plugin: %s",
+                plugin_name
             )
             raise
 
@@ -128,30 +83,22 @@ async def start_services():
 
     app_runner = None
     ping_task = None
-    bot_started = False
 
     try:
 
+        # Initialize Telegram clients
         print("\n")
         print("------------------- Initializing Telegram Bot -------------------")
-
-        await start_bot()
-        bot_started = True
-
-        bot_info = await StreamBot.get_me()
-        StreamBot.username = bot_info.username
-
-        print("------------------------------ DONE ------------------------------")
-        print()
-
-        print("---------------------- Initializing Clients ----------------------")
 
         await initialize_clients()
 
         print("------------------------------ DONE ------------------------------")
         print()
 
-        # Import plugins
+        bot_info = await StreamBot.get_me()
+        StreamBot.username = bot_info.username
+
+        # Initialize plugins
         await load_plugins()
 
         # Keep Alive
@@ -194,8 +141,6 @@ async def start_services():
 
         print("----------------------- Service Started -------------------------")
 
-        bot_info = await StreamBot.get_me()
-
         print(f"Bot        =>> {bot_info.first_name}")
         print(f"Server IP  =>> {bind_address}:{Var.PORT}")
         print(f"Owner      =>> {Var.OWNER_USERNAME}")
@@ -212,13 +157,16 @@ async def start_services():
 
         print("------------------------------------------------------------------")
 
-        await idle()
+        # Keep the application alive
+        await asyncio.Event().wait()
 
     except asyncio.CancelledError:
+
         logging.info("Service cancellation received")
         raise
 
     except Exception:
+
         logging.exception("Application startup/runtime failed")
         raise
 
@@ -239,12 +187,26 @@ async def start_services():
         if app_runner:
             await app_runner.cleanup()
 
-        if bot_started:
+        # Disconnect all Telethon clients
+        for client_id, client in list(multi_clients.items()):
+
             try:
-                await StreamBot.stop()
-                logging.info("Telegram bot stopped")
+                if client.is_connected():
+                    await client.disconnect()
+
+                logging.info(
+                    "Telegram client %s disconnected",
+                    client_id
+                )
+
             except Exception:
-                logging.exception("Telegram bot shutdown error")
+                logging.exception(
+                    "Failed to disconnect client %s",
+                    client_id
+                )
+
+        multi_clients.clear()
+        work_loads.clear()
 
         logging.info("Shutdown completed")
 

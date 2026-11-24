@@ -1,328 +1,271 @@
 
-import re
-import time
-import math
+import asyncio
 import logging
-import mimetypes
-import secrets
+import math
 from urllib.parse import quote
 
 from aiohttp import web
-from aiohttp.http_exceptions import BadStatusLine
-from pyrogram.errors import FloodWait, RPCError
 
 from Adarsh.bot import multi_clients, work_loads
-from Adarsh.server.exceptions import FIleNotFound, InvalidHash
-from Adarsh import StartTime
-from Adarsh.utils.time_format import get_readable_time
-from Adarsh.utils.custom_dl import ByteStreamer
-from Adarsh.utils.render_template import render_page
 from Adarsh.vars import Var
+from Adarsh.server.exceptions import FIleNotFound
+from Adarsh.utils.custom_dl import ByteStreamer
 
 
-routes = web.RouteTableDef()
-class_cache = {}
+logger = logging.getLogger(__name__)
+
+CHUNK_SIZE = 512 * 1024
+
+# One streamer instance per Telegram client.
+streamers = {}
 
 
-@routes.get("/", allow_head=True)
-async def root_route_handler(request):
-    return web.json_response({
-        "server_status": "running",
-        "uptime": get_readable_time(time.time() - StartTime)
-    })
+def get_streamer(index):
+    if index not in streamers:
+        streamers[index] = ByteStreamer(multi_clients[index])
 
-
-def parse_file_path(path, query):
-    """
-    Extract Telegram message ID and secure hash.
-    """
-    match = re.search(r"^([a-zA-Z0-9_-]{6})(\d+)$", path)
-
-    if match:
-        secure_hash = match.group(1)
-        file_id = int(match.group(2))
-    else:
-        match = re.search(r"(\d+)", path)
-
-        if not match:
-            raise web.HTTPNotFound(text="Invalid file URL")
-
-        file_id = int(match.group(1))
-        secure_hash = query.get("hash")
-
-    return file_id, secure_hash
-
-
-@routes.get(r"/watch/{path:\S+}", allow_head=True)
-async def watch_handler(request: web.Request):
-    try:
-        path = request.match_info["path"]
-
-        file_id, secure_hash = parse_file_path(
-            path,
-            request.rel_url.query
-        )
-
-        html = await render_page(file_id, secure_hash)
-
-        return web.Response(
-            text=html,
-            content_type="text/html"
-        )
-
-    except InvalidHash as e:
-        raise web.HTTPForbidden(text=e.message)
-
-    except FIleNotFound as e:
-        raise web.HTTPNotFound(text=e.message)
-
-    except (AttributeError, BadStatusLine, ConnectionResetError):
-        raise web.HTTPBadRequest(text="Invalid request")
-
-    except web.HTTPException:
-        raise
-
-    except Exception:
-        logging.exception("Watch handler error")
-        raise web.HTTPInternalServerError(
-            text="Unable to load video page"
-        )
-
-
-@routes.get(r"/{path:\S+}", allow_head=True)
-async def download_handler(request: web.Request):
-    try:
-        path = request.match_info["path"]
-
-        file_id, secure_hash = parse_file_path(
-            path,
-            request.rel_url.query
-        )
-
-        return await media_streamer(
-            request,
-            file_id,
-            secure_hash
-        )
-
-    except InvalidHash as e:
-        raise web.HTTPForbidden(text=e.message)
-
-    except FIleNotFound as e:
-        raise web.HTTPNotFound(text=e.message)
-
-    except (AttributeError, BadStatusLine, ConnectionResetError):
-        raise web.HTTPBadRequest(text="Invalid request")
-
-    except web.HTTPException:
-        raise
-
-    except (FloodWait, RPCError):
-        logging.exception("Telegram API error")
-        raise web.HTTPServiceUnavailable(
-            text="Telegram is temporarily unavailable. Please retry."
-        )
-
-    except Exception:
-        logging.exception("Download handler error")
-        raise web.HTTPInternalServerError(
-            text="Unable to stream file"
-        )
-
-
-async def get_streamer(client):
-    if client not in class_cache:
-        class_cache[client] = ByteStreamer(client)
-
-    return class_cache[client]
+    return streamers[index]
 
 
 def parse_range_header(range_header, file_size):
     """
-    Parse HTTP Range headers.
+    Parse a single HTTP byte range.
 
     Supports:
-    bytes=100-200
-    bytes=100-
-    bytes=-500
+      bytes=0-1023
+      bytes=1024-
+      bytes=-1024
     """
 
     if not range_header:
         return 0, file_size - 1
 
-    match = re.fullmatch(
-        r"bytes=(\d*)-(\d*)",
-        range_header.strip()
-    )
+    if not range_header.startswith("bytes="):
+        raise ValueError("Invalid range unit")
 
-    if not match:
-        raise ValueError("Invalid range")
+    range_value = range_header.replace("bytes=", "", 1).strip()
 
-    start_str, end_str = match.groups()
+    # Multiple ranges are not supported.
+    if "," in range_value:
+        raise ValueError("Multiple ranges are not supported")
 
-    if not start_str and not end_str:
-        raise ValueError("Invalid range")
+    start_text, end_text = range_value.split("-", 1)
 
-    if not start_str:
-        suffix_length = int(end_str)
+    if not start_text:
+        # Suffix range: last N bytes.
+        suffix_length = int(end_text)
 
         if suffix_length <= 0:
-            raise ValueError("Invalid suffix")
+            raise ValueError("Invalid suffix range")
 
         start = max(file_size - suffix_length, 0)
         end = file_size - 1
 
     else:
-        start = int(start_str)
-        end = int(end_str) if end_str else file_size - 1
+        start = int(start_text)
+        end = int(end_text) if end_text else file_size - 1
 
-    if start >= file_size or end < start:
-        raise ValueError("Range not satisfiable")
+    if start < 0 or end < start or start >= file_size:
+        raise ValueError("Requested range is not satisfiable")
 
     end = min(end, file_size - 1)
 
     return start, end
 
 
-def safe_filename(filename):
+async def media_streamer(request):
     """
-    Prevent unsafe characters in Content-Disposition.
+    Stream a Telegram file using Telethon.
+
+    Expected route parameters:
+        /watch/{id}/{file_name}
+        /dl/{id}/{file_name}
+
+    The message ID is the ID of the file in BIN_CHANNEL.
     """
-    filename = str(filename or "file.unknown")
 
-    filename = filename.replace("\\", "_")
-    filename = filename.replace('"', "_")
-    filename = filename.replace("\r", "_")
-    filename = filename.replace("\n", "_")
-
-    return filename
-
-
-async def media_streamer(
-    request: web.Request,
-    file_id: int,
-    secure_hash: str
-):
-    if not multi_clients:
-        raise web.HTTPServiceUnavailable(
-            text="No Telegram clients available"
-        )
-
-    if not work_loads:
-        raise web.HTTPServiceUnavailable(
-            text="Streaming workers unavailable"
-        )
-
-    index = min(work_loads, key=work_loads.get)
-
-    faster_client = multi_clients[index]
-
-    if Var.MULTI_CLIENT:
-        logging.info(
-            "Client %s serving %s",
-            index,
-            request.remote
-        )
-
-    tg_connect = await get_streamer(faster_client)
-
-    # Get Telegram file properties
-    file_properties = await tg_connect.get_file_properties(file_id)
-
-    if (
-        not secure_hash
-        or file_properties.unique_id[:6] != secure_hash
-    ):
-        raise InvalidHash
-
-    file_size = file_properties.file_size
-
-    if file_size <= 0:
-        raise web.HTTPNotFound(text="Empty file")
-
-    range_header = request.headers.get("Range")
-
-    # Parse HTTP range
     try:
-        from_bytes, until_bytes = parse_range_header(
-            range_header,
-            file_size
+        raw_file_id = (
+            request.match_info.get("id")
+            or request.match_info.get("file_id")
         )
 
-    except ValueError:
+        if not raw_file_id:
+            return web.Response(
+                text="Missing file ID",
+                status=400
+            )
+
+        try:
+            file_id = int(raw_file_id)
+        except (TypeError, ValueError):
+            return web.Response(
+                text="Invalid file ID",
+                status=400
+            )
+
+        if not multi_clients:
+            return web.Response(
+                text="Telegram clients are unavailable",
+                status=503
+            )
+
+        # Select the client with the lowest current workload.
+        index = min(
+            multi_clients.keys(),
+            key=lambda client_index: work_loads.get(client_index, 0)
+        )
+
+        streamer = get_streamer(index)
+
+        # Retrieve Telegram file metadata.
+        file_properties = await streamer.get_file_properties(file_id)
+
+        file_size = int(file_properties.file_size)
+
+        if file_size <= 0:
+            return web.Response(
+                text="Invalid file size",
+                status=404
+            )
+
+        file_name = (
+            request.match_info.get("file_name")
+            or file_properties.file_name
+            or f"file_{file_id}"
+        )
+
+        mime_type = (
+            file_properties.mime_type
+            or "application/octet-stream"
+        )
+
+        # Determine the requested byte range.
+        range_header = request.headers.get("Range")
+
+        try:
+            start, end = parse_range_header(
+                range_header,
+                file_size
+            )
+        except (ValueError, TypeError):
+            return web.Response(
+                status=416,
+                headers={
+                    "Content-Range": f"bytes */{file_size}",
+                    "Accept-Ranges": "bytes"
+                }
+            )
+
+        content_length = end - start + 1
+
+        # Calculate Telegram chunk boundaries.
+        offset = (start // CHUNK_SIZE) * CHUNK_SIZE
+
+        first_part_cut = start - offset
+
+        last_part_cut = (end % CHUNK_SIZE) + 1
+
+        part_count = (
+            (end // CHUNK_SIZE)
+            - (start // CHUNK_SIZE)
+            + 1
+        )
+
+        status = 206 if range_header else 200
+
+        headers = {
+            "Content-Type": mime_type,
+            "Content-Length": str(content_length),
+            "Accept-Ranges": "bytes",
+            "Content-Disposition": (
+                f'inline; filename="{quote(file_name)}"'
+            ),
+            "Cache-Control": "public, max-age=86400",
+            "X-Content-Type-Options": "nosniff"
+        }
+
+        if status == 206:
+            headers["Content-Range"] = (
+                f"bytes {start}-{end}/{file_size}"
+            )
+
+        response = web.StreamResponse(
+            status=status,
+            headers=headers
+        )
+
+        await response.prepare(request)
+
+        # Ask ByteStreamer for the requested Telegram chunks.
+        body = streamer.yield_file(
+            file_properties=file_properties,
+            index=index,
+            offset=offset,
+            first_part_cut=first_part_cut,
+            last_part_cut=last_part_cut,
+            part_count=part_count,
+            chunk_size=CHUNK_SIZE
+        )
+
+        bytes_sent = 0
+
+        try:
+            async for chunk in body:
+                if not chunk:
+                    continue
+
+                # Do not send more bytes than the HTTP range requested.
+                remaining = content_length - bytes_sent
+
+                if remaining <= 0:
+                    break
+
+                if len(chunk) > remaining:
+                    chunk = chunk[:remaining]
+
+                await response.write(chunk)
+
+                bytes_sent += len(chunk)
+
+            if bytes_sent != content_length:
+                logger.warning(
+                    "Incomplete stream for file %s: sent %s of %s bytes",
+                    file_id,
+                    bytes_sent,
+                    content_length
+                )
+
+        except (ConnectionResetError, asyncio.CancelledError):
+            logger.info(
+                "Client disconnected while streaming file %s",
+                file_id
+            )
+            raise
+
+        finally:
+            await body.aclose()
+
+        await response.write_eof()
+
+        return response
+
+    except FIleNotFound:
         return web.Response(
-            status=416,
-            text="416: Range not satisfiable",
-            headers={
-                "Content-Range": f"bytes */{file_size}",
-                "Accept-Ranges": "bytes"
-            }
+            text="File not found",
+            status=404
         )
 
-    # Calculate chunks
-    chunk_size = 1024 * 1024
+    except asyncio.CancelledError:
+        raise
 
-    offset = (
-        from_bytes // chunk_size
-    ) * chunk_size
+    except Exception:
+        logger.exception("File streaming failed")
 
-    first_part_cut = from_bytes - offset
+        if not request.transport or request.transport.is_closing():
+            return web.Response(status=500)
 
-    last_part_cut = (
-        until_bytes % chunk_size
-    ) + 1
-
-    req_length = (
-        until_bytes - from_bytes + 1
-    )
-
-    part_count = math.ceil(
-        (first_part_cut + req_length) / chunk_size
-    )
-
-    # Telegram file generator
-    body = tg_connect.yield_file(
-        file_properties,
-        index,
-        offset,
-        first_part_cut,
-        last_part_cut,
-        part_count,
-        chunk_size
-    )
-
-    # MIME detection
-    file_name = safe_filename(
-        file_properties.file_name
-        or f"{secrets.token_hex(4)}.unknown"
-    )
-
-    mime_type = file_properties.mime_type
-
-    if not mime_type:
-        mime_type = mimetypes.guess_type(file_name)[0]
-
-    if not mime_type:
-        mime_type = "application/octet-stream"
-
-    # Response headers
-    headers = {
-        "Content-Type": mime_type,
-        "Content-Length": str(req_length),
-        "Content-Disposition": (
-            f"attachment; filename*=UTF-8''{quote(file_name)}"
-        ),
-        "Accept-Ranges": "bytes",
-        "Cache-Control": "no-cache"
-    }
-
-    if range_header:
-        headers["Content-Range"] = (
-            f"bytes {from_bytes}-{until_bytes}/{file_size}"
+        return web.Response(
+            text="Internal streaming error",
+            status=500
         )
-
-    return web.Response(
-        status=206 if range_header else 200,
-        body=body,
-        headers=headers
-    )

@@ -1,277 +1,128 @@
 
+# (c) adarsh-goel
+
 import asyncio
 import logging
 
-from typing import Dict, Union
+from typing import Dict
 
-from pyrogram import Client, utils, raw
-from pyrogram.session import Session, Auth
-from pyrogram.errors import (
-    AuthBytesInvalid,
-    FloodWait,
-    RPCError
-)
+from telethon import TelegramClient
+from telethon.errors import FloodWaitError, RPCError
 
-from pyrogram.file_id import (
-    FileId,
-    FileType,
-    ThumbnailSource
-)
-
-from Adarsh.vars import Var
 from Adarsh.bot import work_loads
 from Adarsh.server.exceptions import FIleNotFound
+from Adarsh.vars import Var
 
-from .file_properties import get_file_ids
+from .file_properties import (
+    FileProperties,
+    get_file_ids
+)
 
 
 class ByteStreamer:
 
-    def __init__(self, client: Client):
+    def __init__(self, client: TelegramClient):
+
         self.clean_timer = 30 * 60
 
-        self.client: Client = client
+        self.client = client
 
-        self.cached_file_ids: Dict[int, FileId] = {}
+        self.cached_file_ids: Dict[int, FileProperties] = {}
 
         self._cache_lock = asyncio.Lock()
-        self._session_locks = {}
 
         asyncio.create_task(self.clean_cache())
 
-    async def get_file_properties(self, id: int) -> FileId:
+    async def get_file_properties(
+        self,
+        id: int
+    ) -> FileProperties:
 
         if id not in self.cached_file_ids:
+
             async with self._cache_lock:
+
                 if id not in self.cached_file_ids:
+
                     await self.generate_file_properties(id)
 
         return self.cached_file_ids[id]
 
-    async def generate_file_properties(self, id: int) -> FileId:
+    async def generate_file_properties(
+        self,
+        id: int
+    ) -> FileProperties:
 
-        file_id = await get_file_ids(
+        file_properties = await get_file_ids(
             self.client,
             Var.BIN_CHANNEL,
             id
         )
 
-        if not file_id:
+        if not file_properties:
+
             logging.error(
                 "File not found. Message ID: %s",
                 id
             )
+
             raise FIleNotFound
 
-        self.cached_file_ids[id] = file_id
+        self.cached_file_ids[id] = file_properties
 
         logging.debug(
             "Cached file properties for message ID %s",
             id
         )
 
-        return file_id
+        return file_properties
 
-    async def generate_media_session(
+    async def get_chunk(
         self,
-        client: Client,
-        file_id: FileId
-    ) -> Session:
-
-        dc_id = file_id.dc_id
-
-        media_session = client.media_sessions.get(dc_id)
-
-        if media_session is not None:
-            return media_session
-
-        if dc_id not in self._session_locks:
-            self._session_locks[dc_id] = asyncio.Lock()
-
-        async with self._session_locks[dc_id]:
-
-            media_session = client.media_sessions.get(dc_id)
-
-            if media_session is not None:
-                return media_session
-
-            test_mode = await client.storage.test_mode()
-
-            if dc_id != await client.storage.dc_id():
-
-                auth_key = await Auth(
-                    client,
-                    dc_id,
-                    test_mode
-                ).create()
-
-            else:
-                auth_key = await client.storage.auth_key()
-
-            media_session = Session(
-                client,
-                dc_id,
-                auth_key,
-                test_mode,
-                is_media=True
-            )
-
-            try:
-
-                await media_session.start()
-
-                if dc_id != await client.storage.dc_id():
-
-                    authorized = False
-
-                    for attempt in range(5):
-
-                        exported_auth = await client.invoke(
-                            raw.functions.auth.ExportAuthorization(
-                                dc_id=dc_id
-                            )
-                        )
-
-                        try:
-
-                            await media_session.send(
-                                raw.functions.auth.ImportAuthorization(
-                                    id=exported_auth.id,
-                                    bytes=exported_auth.bytes
-                                )
-                            )
-
-                            authorized = True
-                            break
-
-                        except AuthBytesInvalid:
-
-                            logging.warning(
-                                "Invalid authorization bytes for DC %s",
-                                dc_id
-                            )
-
-                            await asyncio.sleep(
-                                min(2 ** attempt, 10)
-                            )
-
-                    if not authorized:
-                        raise AuthBytesInvalid
-
-                client.media_sessions[dc_id] = media_session
-
-                logging.info(
-                    "Media session created for DC %s",
-                    dc_id
-                )
-
-                return media_session
-
-            except Exception:
-
-                try:
-                    await media_session.stop()
-                except Exception:
-                    logging.exception(
-                        "Failed to stop media session"
-                    )
-
-                raise
-
-    @staticmethod
-    async def get_location(
-        file_id: FileId
-    ) -> Union[
-        raw.types.InputPhotoFileLocation,
-        raw.types.InputDocumentFileLocation,
-        raw.types.InputPeerPhotoFileLocation
-    ]:
-
-        file_type = file_id.file_type
-
-        if file_type == FileType.CHAT_PHOTO:
-
-            if file_id.chat_id > 0:
-
-                peer = raw.types.InputPeerUser(
-                    user_id=file_id.chat_id,
-                    access_hash=file_id.chat_access_hash
-                )
-
-            elif file_id.chat_access_hash == 0:
-
-                peer = raw.types.InputPeerChat(
-                    chat_id=-file_id.chat_id
-                )
-
-            else:
-
-                peer = raw.types.InputPeerChannel(
-                    channel_id=utils.get_channel_id(
-                        file_id.chat_id
-                    ),
-                    access_hash=file_id.chat_access_hash
-                )
-
-            location = raw.types.InputPeerPhotoFileLocation(
-                peer=peer,
-                volume_id=file_id.volume_id,
-                local_id=file_id.local_id,
-                big=(
-                    file_id.thumbnail_source
-                    == ThumbnailSource.CHAT_PHOTO_BIG
-                )
-            )
-
-        elif file_type == FileType.PHOTO:
-
-            location = raw.types.InputPhotoFileLocation(
-                id=file_id.media_id,
-                access_hash=file_id.access_hash,
-                file_reference=file_id.file_reference,
-                thumb_size=file_id.thumbnail_size
-            )
-
-        else:
-
-            location = raw.types.InputDocumentFileLocation(
-                id=file_id.media_id,
-                access_hash=file_id.access_hash,
-                file_reference=file_id.file_reference,
-                thumb_size=file_id.thumbnail_size
-            )
-
-        return location
-
-    async def get_file_with_retry(
-        self,
-        media_session,
-        location,
-        offset,
-        chunk_size,
-        retries=5
+        file_properties: FileProperties,
+        offset: int,
+        chunk_size: int,
+        retries: int = 5
     ):
 
         for attempt in range(retries):
 
+            stream = None
+
             try:
 
-                return await media_session.send(
-                    raw.functions.upload.GetFile(
-                        location=location,
-                        offset=offset,
-                        limit=chunk_size
-                    )
+                stream = self.client.iter_download(
+                    file_properties.message,
+                    offset=offset,
+                    limit=1,
+                    chunk_size=chunk_size,
+                    request_size=chunk_size,
+                    file_size=file_properties.file_size
                 )
 
-            except FloodWait as e:
+                chunk = await stream.__anext__()
+
+                if not chunk:
+                    return b""
+
+                return bytes(chunk)
+
+            except StopAsyncIteration:
+                return b""
+
+            except FloodWaitError as e:
+
+                delay = max(
+                    int(getattr(e, "seconds", 5)),
+                    1
+                )
 
                 logging.warning(
                     "Telegram FloodWait: %s seconds",
-                    e.value
+                    delay
                 )
 
-                await asyncio.sleep(e.value)
+                await asyncio.sleep(delay)
 
             except RPCError as e:
 
@@ -288,19 +139,31 @@ class ByteStreamer:
 
                 await asyncio.sleep(delay)
 
-            except asyncio.TimeoutError:
+            except asyncio.CancelledError:
+                raise
+
+            except Exception:
 
                 if attempt == retries - 1:
                     raise
 
                 delay = min(2 ** attempt, 15)
 
-                logging.warning(
-                    "Telegram timeout. Retrying in %s seconds",
+                logging.exception(
+                    "Telegram download failed. Retrying in %s seconds",
                     delay
                 )
 
                 await asyncio.sleep(delay)
+
+            finally:
+
+                if stream is not None:
+
+                    try:
+                        await stream.close()
+                    except Exception:
+                        pass
 
         raise asyncio.TimeoutError(
             "Telegram file request failed"
@@ -308,7 +171,7 @@ class ByteStreamer:
 
     async def yield_file(
         self,
-        file_id: FileId,
+        file_id: FileProperties,
         index: int,
         offset: int,
         first_part_cut: int,
@@ -319,40 +182,32 @@ class ByteStreamer:
 
         work_loads[index] += 1
 
-        current_part = 1
+        current_part = 0
 
         try:
 
-            client = self.client
+            while current_part < part_count:
 
-            media_session = await self.generate_media_session(
-                client,
-                file_id
-            )
+                chunk_offset = (
+                    offset + current_part * chunk_size
+                )
 
-            location = await self.get_location(file_id)
-
-            while current_part <= part_count:
-
-                r = await self.get_file_with_retry(
-                    media_session,
-                    location,
-                    offset,
+                chunk = await self.get_chunk(
+                    file_id,
+                    chunk_offset,
                     chunk_size
                 )
 
-                if not isinstance(r, raw.types.upload.File):
+                if not chunk:
 
-                    logging.error(
-                        "Unexpected Telegram file response"
+                    logging.warning(
+                        "Empty Telegram chunk at offset %s",
+                        chunk_offset
                     )
 
                     break
 
-                chunk = r.bytes
-
-                if not chunk:
-                    break
+                current_part += 1
 
                 if part_count == 1:
 
@@ -371,9 +226,6 @@ class ByteStreamer:
                 else:
 
                     yield chunk
-
-                current_part += 1
-                offset += chunk_size
 
         except asyncio.CancelledError:
 
@@ -395,12 +247,12 @@ class ByteStreamer:
 
             logging.debug(
                 "Finished streaming after %s parts",
-                current_part - 1
+                current_part
             )
 
             work_loads[index] = max(
                 0,
-                work_loads[index] - 1
+                work_loads.get(index, 0) - 1
             )
 
     async def clean_cache(self):
@@ -410,6 +262,7 @@ class ByteStreamer:
             await asyncio.sleep(self.clean_timer)
 
             async with self._cache_lock:
+
                 self.cached_file_ids.clear()
 
             logging.debug(
