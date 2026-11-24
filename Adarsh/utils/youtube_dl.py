@@ -1,6 +1,7 @@
 # (c) adarsh-goel
 
 import asyncio
+import base64
 import logging
 import os
 import shlex
@@ -43,7 +44,23 @@ class YouTubeStreamer:
             logger.info("Using YouTube cookies from YOUTUBE_COOKIES env var")
             return self._cookie_temp_file.name
         
-        # Priority 2: Cookie file from env var or default (only if not invalidated)
+        # Priority 2: Base64 encoded cookies from env var (write to temp file)
+        b64_cookies = os.getenv("YOUTUBE_COOKIES_B64")
+        if b64_cookies:
+            import tempfile
+            try:
+                decoded = base64.b64decode(b64_cookies).decode()
+                self._cookie_temp_file = tempfile.NamedTemporaryFile(
+                    mode='w', suffix='.txt', delete=False, prefix='yt_cookies_'
+                )
+                self._cookie_temp_file.write(decoded)
+                self._cookie_temp_file.close()
+                logger.info("Using YouTube cookies from YOUTUBE_COOKIES_B64 env var")
+                return self._cookie_temp_file.name
+            except Exception as e:
+                logger.warning("Failed to decode YOUTUBE_COOKIES_B64: %s", e)
+        
+        # Priority 3: Cookie file from env var or default (only if not invalidated)
         if self.cookie_file and os.path.exists(self.cookie_file):
             # Validate cookie file is readable, has content, AND is parseable by MozillaCookieJar
             try:
