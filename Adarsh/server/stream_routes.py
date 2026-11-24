@@ -269,3 +269,7 @@ async def media_streamer(request):
             text="Internal streaming error",
             status=500
         )
+routes = [
+    web.get("/watch/{id}/{file_name}", media_streamer),
+    web.get("/dl/{id}/{file_name}", media_streamer),
+]
