@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import os
 import shlex
 from typing import Optional, AsyncGenerator
 
@@ -17,6 +18,29 @@ class YouTubeStreamer:
         self.yt_dlp_path = "yt-dlp"
         self._ffmpeg_checked = False
         self._has_ffmpeg = False
+        # Cookie file for YouTube authentication (optional)
+        self.cookie_file = os.getenv("YOUTUBE_COOKIES_FILE", "/tmp/youtube_cookies.txt")
+
+    def _get_base_cmd(self):
+        """Base yt-dlp command with anti-bot options."""
+        cmd = [
+            self.yt_dlp_path,
+            "--no-check-certificates",
+            "--no-warnings",
+            "--ignore-errors",
+            "--extractor-retries", "3",
+            "--socket-timeout", "30",
+            "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "--referer", "https://www.youtube.com/",
+            "--add-header", "Accept-Language:en-US,en;q=0.9",
+        ]
+        
+        # Add cookies if file exists
+        if os.path.exists(self.cookie_file):
+            cmd.extend(["--cookies", self.cookie_file])
+            logger.info("Using YouTube cookies from %s", self.cookie_file)
+        
+        return cmd
 
     async def _check_ffmpeg(self) -> bool:
         """Check if ffmpeg is available."""
@@ -40,8 +64,7 @@ class YouTubeStreamer:
 
     async def get_video_info(self, url: str) -> dict:
         """Get video metadata without downloading."""
-        cmd = [
-            self.yt_dlp_path,
+        cmd = self._get_base_cmd() + [
             "--dump-json",
             "--no-download",
             "--skip-download",
@@ -67,31 +90,46 @@ class YouTubeStreamer:
             raise
 
     async def get_stream_url(self, url: str, quality: str = "best[ext=mp4]/best") -> str:
-        """Get direct stream URL for a YouTube video."""
-        cmd = [
-            self.yt_dlp_path,
-            "-g",
-            "-f", quality,
-            url
+        """Get direct stream URL for a YouTube video with fallback formats."""
+        # Try multiple format selectors in order of preference
+        formats = [
+            quality,
+            "best[ext=mp4]/best",
+            "best[protocol^=http]/best",
+            "worst[ext=mp4]/worst",
+            "best",
         ]
         
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            stdout, stderr = await proc.communicate()
+        last_error = None
+        for fmt in formats:
+            cmd = self._get_base_cmd() + [
+                "-g",
+                "-f", fmt,
+                url
+            ]
             
-            if proc.returncode != 0:
-                logger.error("yt-dlp get URL failed: %s", stderr.decode())
-                raise Exception(f"Failed to get stream URL: {stderr.decode()}")
-            
-            urls = stdout.decode().strip().split('\n')
-            return urls[0] if urls else None
-        except Exception as e:
-            logger.exception("Error getting stream URL")
-            raise
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                stdout, stderr = await proc.communicate()
+                
+                if proc.returncode == 0:
+                    urls = stdout.decode().strip().split('\n')
+                    if urls and urls[0]:
+                        logger.info("Got stream URL with format: %s", fmt)
+                        return urls[0]
+                
+                last_error = stderr.decode()
+                logger.warning("Format %s failed: %s", fmt, last_error[:200])
+                
+            except Exception as e:
+                last_error = str(e)
+                logger.warning("Format %s exception: %s", fmt, e)
+        
+        raise Exception(f"All format attempts failed. Last error: {last_error}")
 
     async def stream_video(
         self,

@@ -144,11 +144,56 @@ async def media_streamer(request):
                 status=503
             )
 
+        # Wait for at least one client to be connected (max 30s)
+        max_wait = 30
+        wait_interval = 1
+        waited = 0
+        connected = False
+        
+        while waited < max_wait:
+            for idx, client in multi_clients.items():
+                if client.is_connected():
+                    connected = True
+                    break
+            if connected:
+                break
+            await asyncio.sleep(wait_interval)
+            waited += wait_interval
+        
+        if not connected:
+            logger.warning("No Telegram clients connected after %ss, trying YouTube fallback", max_wait)
+            # Try YouTube fallback immediately if bot not connected
+            if youtube_id_param and is_youtube_url(youtube_id_param):
+                youtube_id = extract_youtube_id(youtube_id_param)
+                youtube_url = f"https://www.youtube.com/watch?v={youtube_id}"
+                return await stream_youtube_video(request, youtube_url, youtube_id)
+            return web.Response(
+                text="Telegram bot not connected yet, please retry in a moment",
+                status=503
+            )
+
         # Select the client with the lowest current workload.
         index = min(
             multi_clients.keys(),
             key=lambda client_index: work_loads.get(client_index, 0)
         )
+
+        # Ensure selected client is connected
+        if not multi_clients[index].is_connected():
+            # Find any connected client
+            for idx, client in multi_clients.items():
+                if client.is_connected():
+                    index = idx
+                    break
+            else:
+                if youtube_id_param and is_youtube_url(youtube_id_param):
+                    youtube_id = extract_youtube_id(youtube_id_param)
+                    youtube_url = f"https://www.youtube.com/watch?v={youtube_id}"
+                    return await stream_youtube_video(request, youtube_url, youtube_id)
+                return web.Response(
+                    text="No connected Telegram clients available",
+                    status=503
+                )
 
         streamer = get_streamer(index)
 
