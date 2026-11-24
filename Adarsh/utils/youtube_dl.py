@@ -305,8 +305,8 @@ class YouTubeStreamer:
                         cookies_invalid = True
                         logger.warning("Cookies appear invalid, will skip cookie attempts")
                     
-                    # If "no longer supported" error, try next client immediately
-                    if "no longer supported" in stderr_str.lower():
+                    # If "no longer supported" or "video unavailable" error, try next client immediately
+                    if "no longer supported" in stderr_str.lower() or "video is unavailable" in stderr_str.lower():
                         continue
                     
                 except Exception as e:
@@ -476,8 +476,8 @@ class YouTubeStreamer:
                             cookies_invalid = True
                             logger.warning("Cookies appear invalid, will skip cookie attempts")
                         
-                        # If "no longer supported" error, try next client immediately
-                        if "no longer supported" in stderr_str.lower():
+                        # If "no longer supported" or "video unavailable" error, try next client immediately
+                        if "no longer supported" in stderr_str.lower() or "video is unavailable" in stderr_str.lower():
                             break  # break format loop, try next client
                         
                         # If format not available, try next format

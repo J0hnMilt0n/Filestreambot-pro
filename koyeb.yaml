@@ -18,9 +18,10 @@ services:
         value: "8080"
       - name: PYTHONUNBUFFERED
         value: "1"
-    # Use buildpack (like Heroku)
+    # Use Docker (required for Deno, ffmpeg, gcc for TgCrypto)
     build:
-      buildpack: heroku/python
+      docker:
+        dockerfile: Dockerfile
     run:
       cmd: python -m Adarsh
     # Health checks
@@ -42,4 +43,5 @@ services:
 
 # Required environment variables (set in Koyeb dashboard or via CLI)
 # API_ID, API_HASH, BOT_TOKEN, BIN_CHANNEL, DATABASE_URL, OWNER_ID
+# Optional: YOUTUBE_COOKIES (Netscape format cookie content)
 # Optional: YOUTUBE_COOKIES_FILE=/app/youtube_cookies.txt
