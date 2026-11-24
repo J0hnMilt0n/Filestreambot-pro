@@ -4,7 +4,7 @@ import asyncio
 import logging
 import os
 import shlex
-from typing import Optional, AsyncGenerator
+from typing import Optional, AsyncGenerator, Dict, Any
 
 import aiohttp
 
@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 
 class YouTubeStreamer:
-    """Stream YouTube videos using yt-dlp."""
+    """Stream YouTube videos using yt-dlp with Invidious fallback."""
 
     def __init__(self):
         self.yt_dlp_path = "yt-dlp"
@@ -23,6 +23,8 @@ class YouTubeStreamer:
         # Cookie content from env var (alternative to file)
         self.cookie_content = os.getenv("YOUTUBE_COOKIES")
         self._cookie_temp_file = None
+        # Cache for video info to avoid duplicate calls
+        self._info_cache: Dict[str, Dict[str, Any]] = {}
 
     def _prepare_cookies(self) -> Optional[str]:
         """Prepare cookie file from env var or existing file. Returns path or None."""
@@ -98,157 +100,26 @@ class YouTubeStreamer:
         
         self._ffmpeg_checked = True
         logger.info("ffmpeg available: %s", self._has_ffmpeg)
-        return self._has_ffmpeg
 
-    def _get_info_cmd(self):
-        """Base command for getting video info (no format restrictions)."""
-        cmd = [
-            self.yt_dlp_path,
-            "--no-check-certificates",
-            "--no-warnings",
-            "--ignore-errors",
-            "--extractor-retries", "3",
-            "--socket-timeout", "30",
-            # Use default player client for info (more compatible)
-            "--age-limit", "99",
-            # NOTE: Removed --extractor-args youtube:skip=hls,dash
-            # HLS/DASH are often the ONLY available formats.
-            "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "--referer", "https://www.youtube.com/",
-            "--add-header", "Accept-Language:en-US,en;q=0.9",
-        ]
-        
-        # Add cookies from env var or file
-        cookie_path = self._prepare_cookies()
-        if cookie_path:
-            cmd.extend(["--cookies", cookie_path])
-        
-        return cmd
+    def _extract_video_id(self, url: str) -> str:
+        """Extract video ID from YouTube URL."""
+        if "v=" in url:
+            return url.split("v=")[-1].split("&")[0]
+        elif "youtu.be/" in url:
+            return url.split("youtu.be/")[-1].split("?")[0]
+        return url
 
-    async def get_video_info(self, url: str) -> dict:
-        """Get video metadata without downloading. Tries multiple player clients + Invidious fallback."""
-        # Try multiple player clients in order of preference
-        player_clients = [
-            "android_embedded",
-            "tv_embedded", 
-            "web_embedded",
-            "web",
-            "default",  # No extractor args
-        ]
-        
-        last_error = None
-        
-        for player_client in player_clients:
-            cmd = self._get_info_cmd()
-            
-            # Set player client
-            if player_client == "default":
-                # Remove extractor-args
-                try:
-                    idx = cmd.index("--extractor-args")
-                    cmd.pop(idx)
-                    cmd.pop(idx)
-                except ValueError:
-                    pass
-            else:
-                # Replace or add extractor-args
-                try:
-                    idx = cmd.index("--extractor-args")
-                    cmd[idx+1] = f"youtube:player_client={player_client}"
-                except ValueError:
-                    cmd.extend(["--extractor-args", f"youtube:player_client={player_client}"])
-            
-            cmd.extend(["--dump-json", "--no-download", "--skip-download", url])
-            
-            try:
-                proc = await asyncio.create_subprocess_exec(
-                    *cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
-                )
-                # Add timeout to prevent hanging
-                try:
-                    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30.0)
-                except asyncio.TimeoutError:
-                    proc.kill()
-                    await proc.communicate()
-                    logger.warning("Video info timeout (client: %s)", player_client)
-                    continue
-                
-                if proc.returncode == 0:
-                    stdout_str = stdout.decode().strip()
-                    if stdout_str:
-                        import json
-                        info = json.loads(stdout_str)
-                        logger.info("Got video info with player_client: %s", player_client)
-                        self._cleanup_cookies()
-                        return info
-                    else:
-                        logger.warning("Video info empty output (client: %s)", player_client)
-                
-                last_error = stderr.decode()
-                logger.warning("Video info failed (client: %s): %s", player_client, last_error[:200])
-                
-            except Exception as e:
-                last_error = str(e)
-                logger.warning("Video info exception (client: %s): %s", player_client, e)
-        
-        # Last resort: try without any special args
-        logger.info("All player clients failed for video info, trying basic command...")
-        try:
-            basic_cmd = [
-                self.yt_dlp_path,
-                "--no-check-certificates",
-                "--no-warnings",
-                "--ignore-errors",
-                "--dump-json",
-                "--no-download",
-                "--skip-download",
-                url
-            ]
-            cookie_path = self._prepare_cookies()
-            if cookie_path:
-                basic_cmd.extend(["--cookies", cookie_path])
-            
-            proc = await asyncio.create_subprocess_exec(
-                *basic_cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            try:
-                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30.0)
-            except asyncio.TimeoutError:
-                proc.kill()
-                await proc.communicate()
-                logger.warning("Basic video info timeout")
-                last_error = "timeout"
-            else:
-                if proc.returncode == 0:
-                    stdout_str = stdout.decode().strip()
-                    if stdout_str:
-                        import json
-                        info = json.loads(stdout_str)
-                        logger.info("Got video info with basic command")
-                        self._cleanup_cookies()
-                        return info
-                
-                last_error = stderr.decode()
-        except Exception as e:
-            last_error = str(e)
-        
-        # Fallback: Try Invidious instances (bypasses YouTube IP blocking)
-        logger.info("Trying Invidious fallback for video info...")
+    async def _get_invidious_info(self, video_id: str) -> Optional[Dict[str, Any]]:
+        """Get video info from Invidious instances (fast, no yt-dlp)."""
         invidious_instances = [
             "https://yewtu.be",
             "https://invidious.snopyta.org",
             "https://invidious.nerdvpn.de",
         ]
         
-        video_id = url.split("v=")[-1].split("&")[0]
         for instance in invidious_instances:
             try:
                 invidious_url = f"{instance}/api/v1/videos/{video_id}"
-                import aiohttp
                 async with aiohttp.ClientSession() as session:
                     async with session.get(invidious_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                         if resp.status == 200:
@@ -275,46 +146,185 @@ class YouTubeStreamer:
                                     "acodec": fmt.get("mimeType", "").split("/")[0] if "audio" in fmt.get("mimeType", "") else "none",
                                 })
                             logger.info("Got video info from Invidious: %s", instance)
-                            self._cleanup_cookies()
                             return info
             except Exception as e:
                 logger.warning("Invidious %s failed: %s", instance, e)
                 continue
+        return None
+
+    async def _get_invidious_stream_url(self, video_id: str) -> Optional[str]:
+        """Get direct stream URL from Invidious (fast, no yt-dlp)."""
+        invidious_instances = [
+            "https://yewtu.be",
+            "https://invidious.snopyta.org",
+            "https://invidious.nerdvpn.de",
+        ]
+        
+        for instance in invidious_instances:
+            try:
+                invidious_url = f"{instance}/api/v1/videos/{video_id}"
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(invidious_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                        if resp.status == 200:
+                            import json
+                            data = await resp.json()
+                            # Find best mp4 format
+                            best_url = None
+                            for fmt in data.get("adaptiveFormats", []):
+                                if fmt.get("mimeType", "").startswith("video/") and fmt.get("url"):
+                                    best_url = fmt["url"]
+                                    break
+                            if not best_url:
+                                for fmt in data.get("adaptiveFormats", []):
+                                    if fmt.get("url"):
+                                        best_url = fmt["url"]
+                                        break
+                            if best_url:
+                                logger.info("Got stream URL from Invidious: %s", instance)
+                                return best_url
+            except Exception as e:
+                logger.warning("Invidious stream %s failed: %s", instance, e)
+                continue
+        return None
+
+    async def get_video_info(self, url: str) -> dict:
+        """Get video metadata. Try Invidious FIRST (fast), then yt-dlp as fallback."""
+        video_id = self._extract_video_id(url)
+        
+        # Check cache first
+        if video_id in self._info_cache:
+            logger.info("Using cached video info for %s", video_id)
+            return self._info_cache[video_id]
+        
+        # Try Invidious FIRST (fast, no yt-dlp subprocess)
+        logger.info("Trying Invidious for video info: %s", video_id)
+        info = await self._get_invidious_info(video_id)
+        if info and info.get("formats"):
+            self._info_cache[video_id] = info
+            self._cleanup_cookies()
+            return info
+        
+        # Fallback to yt-dlp with limited attempts
+        logger.info("Invidious failed, trying yt-dlp for video info...")
+        player_clients = ["android_embedded", "tv_embedded", "web_embedded", "web", "default"]
+        
+        for player_client in player_clients:
+            cmd = self._get_base_cmd()
+            
+            if player_client == "default":
+                try:
+                    idx = cmd.index("--extractor-args")
+                    cmd.pop(idx)
+                    cmd.pop(idx)
+                except ValueError:
+                    pass
+            else:
+                try:
+                    idx = cmd.index("--extractor-args")
+                    cmd[idx+1] = f"youtube:player_client={player_client}"
+                except ValueError:
+                    cmd.extend(["--extractor-args", f"youtube:player_client={player_client}"])
+            
+            cmd.extend(["--dump-json", "--no-download", "--skip-download", url])
+            
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                try:
+                    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30.0)
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    await proc.communicate()
+                    logger.warning("Video info timeout (client: %s)", player_client)
+                    continue
+                
+                if proc.returncode == 0:
+                    stdout_str = stdout.decode().strip()
+                    if stdout_str:
+                        import json
+                        info = json.loads(stdout_str)
+                        logger.info("Got video info with player_client: %s", player_client)
+                        self._info_cache[video_id] = info
+                        self._cleanup_cookies()
+                        return info
+                
+                logger.warning("Video info failed (client: %s): %s", player_client, stderr.decode()[:200])
+                
+            except Exception as e:
+                logger.warning("Video info exception (client: %s): %s", player_client, e)
+        
+        # Last resort: basic command
+        logger.info("All player clients failed, trying basic command...")
+        try:
+            basic_cmd = [
+                self.yt_dlp_path,
+                "--no-check-certificates",
+                "--no-warnings",
+                "--ignore-errors",
+                "--dump-json",
+                "--no-download",
+                "--skip-download",
+                url
+            ]
+            cookie_path = self._prepare_cookies()
+            if cookie_path:
+                basic_cmd.extend(["--cookies", cookie_path])
+            
+            proc = await asyncio.create_subprocess_exec(
+                *basic_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            try:
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30.0)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.communicate()
+                logger.warning("Basic video info timeout")
+            else:
+                if proc.returncode == 0:
+                    stdout_str = stdout.decode().strip()
+                    if stdout_str:
+                        import json
+                        info = json.loads(stdout_str)
+                        logger.info("Got video info with basic command")
+                        self._info_cache[video_id] = info
+                        self._cleanup_cookies()
+                        return info
+        except Exception as e:
+            logger.warning("Basic video info exception: %s", e)
         
         self._cleanup_cookies()
-        logger.error("All video info attempts failed: %s", last_error)
+        logger.error("All video info attempts failed for %s", video_id)
         # Return minimal info so streaming can still attempt
-        return {"id": video_id, "title": "YouTube Video"}
+        minimal_info = {"id": video_id, "title": "YouTube Video", "formats": []}
+        self._info_cache[video_id] = minimal_info
+        return minimal_info
 
     async def get_stream_url(self, url: str, quality: str = "best[ext=mp4]/best") -> str:
-        """Get direct stream URL for a YouTube video with fallback formats + Invidious."""
-        # Try multiple player clients in order of preference
-        player_clients = [
-            "android_embedded",
-            "tv_embedded", 
-            "web_embedded",
-            "web",
-            "default",  # No extractor args
-        ]
+        """Get direct stream URL. Try Invidious FIRST (fast), then yt-dlp as fallback."""
+        video_id = self._extract_video_id(url)
         
-        # Format selectors to try
-        formats = [
-            quality,
-            "best[ext=mp4]/best",
-            "best[protocol^=http]/best",
-            "worst[ext=mp4]/worst",
-            "best",
-        ]
+        # Try Invidious FIRST (fast, no yt-dlp subprocess)
+        logger.info("Trying Invidious for stream URL: %s", video_id)
+        stream_url = await self._get_invidious_stream_url(video_id)
+        if stream_url:
+            self._cleanup_cookies()
+            return stream_url
         
-        last_error = None
+        # Fallback to yt-dlp with limited attempts
+        logger.info("Invidious failed, trying yt-dlp for stream URL...")
+        player_clients = ["android_embedded", "default"]
+        formats = [quality, "best[ext=mp4]/best", "best[protocol^=http]/best", "best"]
         
         for player_client in player_clients:
             for fmt in formats:
                 cmd = self._get_base_cmd()
                 
-                # Set player client
                 if player_client == "default":
-                    # Remove extractor-args
                     try:
                         idx = cmd.index("--extractor-args")
                         cmd.pop(idx)
@@ -322,7 +332,6 @@ class YouTubeStreamer:
                     except ValueError:
                         pass
                 else:
-                    # Replace or add extractor-args
                     try:
                         idx = cmd.index("--extractor-args")
                         cmd[idx+1] = f"youtube:player_client={player_client}"
@@ -337,7 +346,6 @@ class YouTubeStreamer:
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE
                     )
-                    # Add timeout to prevent hanging
                     try:
                         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30.0)
                     except asyncio.TimeoutError:
@@ -353,41 +361,13 @@ class YouTubeStreamer:
                             self._cleanup_cookies()
                             return urls[0]
                     
-                    last_error = stderr.decode()
-                    logger.warning("Format %s (client: %s) failed: %s", fmt, player_client, last_error[:200])
+                    logger.warning("Format %s (client: %s) failed: %s", fmt, player_client, stderr.decode()[:200])
                     
                 except Exception as e:
-                    last_error = str(e)
                     logger.warning("Format %s (client: %s) exception: %s", fmt, player_client, e)
         
-        # Last resort: try to list formats and pick any available
-        logger.info("All format attempts failed, trying to list available formats...")
-        try:
-            list_cmd = self._get_base_cmd() + ["--list-formats", url]
-            proc = await asyncio.create_subprocess_exec(
-                *list_cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            try:
-                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30.0)
-            except asyncio.TimeoutError:
-                proc.kill()
-                await proc.communicate()
-                logger.warning("List formats timeout")
-            else:
-                logger.info("Available formats for %s:\n%s", url, stdout.decode()[:2000])
-        except Exception as e:
-            logger.warning("Failed to list formats: %s", e)
-        
-        # Fallback: Try Invidious instances for direct stream URL
-        logger.info("Trying Invidious fallback for stream URL...")
-        video_id = url.split("v=")[-1].split("&")[0]
-        invidious_instances = [
-            "https://yewtu.be",
-            "https://invidious.snopyta.org",
-            "https://invidious.nerdvpn.de",
-        ]
+        self._cleanup_cookies()
+        raise Exception(f"All stream URL attempts failed for {video_id}")
         
         for instance in invidious_instances:
             try:
