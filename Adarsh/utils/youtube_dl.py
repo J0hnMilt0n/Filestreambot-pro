@@ -303,7 +303,10 @@ class YouTubeStreamer:
                     # Detect invalid cookies - stop using them
                     if "sign in to confirm" in stderr_str.lower() or "not a bot" in stderr_str.lower():
                         cookies_invalid = True
-                        logger.warning("Cookies appear invalid, will skip cookie attempts")
+                        # Clear cookie content so _prepare_cookies returns None for future attempts
+                        self.cookie_content = None
+                        self._cleanup_cookies()
+                        logger.warning("Cookies appear invalid, cleared cookies and will skip cookie attempts")
                     
                     # If "no longer supported" or "video unavailable" error, try next client immediately
                     if "no longer supported" in stderr_str.lower() or "video is unavailable" in stderr_str.lower():
@@ -474,7 +477,10 @@ class YouTubeStreamer:
                         # Detect invalid cookies - stop using them
                         if "sign in to confirm" in stderr_str.lower() or "not a bot" in stderr_str.lower():
                             cookies_invalid = True
-                            logger.warning("Cookies appear invalid, will skip cookie attempts")
+                            # Clear cookie content so _prepare_cookies returns None for future attempts
+                            self.cookie_content = None
+                            self._cleanup_cookies()
+                            logger.warning("Cookies appear invalid, cleared cookies and will skip cookie attempts")
                         
                         # If "no longer supported" or "video unavailable" error, try next client immediately
                         if "no longer supported" in stderr_str.lower() or "video is unavailable" in stderr_str.lower():
