@@ -65,7 +65,9 @@ class YouTubeStreamer:
             "--extractor-args", "youtube:player_client=android_embedded",
             # Age-gate bypass
             "--age-limit", "99",
-            "--extractor-args", "youtube:skip=hls,dash",
+            # NOTE: Removed --extractor-args youtube:skip=hls,dash
+            # HLS/DASH are often the ONLY available formats. Skipping them causes
+            # "Requested format is not available" for many videos.
             "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "--referer", "https://www.youtube.com/",
             "--add-header", "Accept-Language:en-US,en;q=0.9",
@@ -109,7 +111,8 @@ class YouTubeStreamer:
             "--socket-timeout", "30",
             # Use default player client for info (more compatible)
             "--age-limit", "99",
-            "--extractor-args", "youtube:skip=hls,dash",
+            # NOTE: Removed --extractor-args youtube:skip=hls,dash
+            # HLS/DASH are often the ONLY available formats.
             "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "--referer", "https://www.youtube.com/",
             "--add-header", "Accept-Language:en-US,en;q=0.9",
@@ -123,7 +126,7 @@ class YouTubeStreamer:
         return cmd
 
     async def get_video_info(self, url: str) -> dict:
-        """Get video metadata without downloading. Tries multiple player clients."""
+        """Get video metadata without downloading. Tries multiple player clients + Invidious fallback."""
         # Try multiple player clients in order of preference
         player_clients = [
             "android_embedded",
@@ -214,13 +217,59 @@ class YouTubeStreamer:
         except Exception as e:
             last_error = str(e)
         
+        # Fallback: Try Invidious instances (bypasses YouTube IP blocking)
+        logger.info("Trying Invidious fallback for video info...")
+        invidious_instances = [
+            "https://yewtu.be",
+            "https://invidious.snopyta.org",
+            "https://invidious.nerdvpn.de",
+            "https://yewtu.be",
+        ]
+        
+        video_id = url.split("v=")[-1].split("&")[0]
+        for instance in invidious_instances:
+            try:
+                invidious_url = f"{instance}/api/v1/videos/{video_id}"
+                import aiohttp
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(invidious_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                        if resp.status == 200:
+                            import json
+                            data = await resp.json()
+                            # Convert Invidious format to yt-dlp-like format
+                            info = {
+                                "id": video_id,
+                                "title": data.get("title", "YouTube Video"),
+                                "duration": data.get("length_seconds", 0),
+                                "formats": [],
+                            }
+                            # Add format info from Invidious
+                            for fmt in data.get("adaptiveFormats", []):
+                                info["formats"].append({
+                                    "url": fmt.get("url"),
+                                    "ext": fmt.get("mimeType", "").split("/")[-1].split(";")[0],
+                                    "filesize": fmt.get("contentLength"),
+                                    "format_id": fmt.get("itag"),
+                                    "height": fmt.get("height"),
+                                    "width": fmt.get("width"),
+                                    "fps": fmt.get("fps"),
+                                    "vcodec": fmt.get("mimeType", "").split("/")[0] if "video" in fmt.get("mimeType", "") else "none",
+                                    "acodec": fmt.get("mimeType", "").split("/")[0] if "audio" in fmt.get("mimeType", "") else "none",
+                                })
+                            logger.info("Got video info from Invidious: %s", instance)
+                            self._cleanup_cookies()
+                            return info
+            except Exception as e:
+                logger.warning("Invidious %s failed: %s", instance, e)
+                continue
+        
         self._cleanup_cookies()
         logger.error("All video info attempts failed: %s", last_error)
         # Return minimal info so streaming can still attempt
-        return {"id": url.split("v=")[-1].split("&")[0], "title": "YouTube Video"}
+        return {"id": video_id, "title": "YouTube Video"}
 
     async def get_stream_url(self, url: str, quality: str = "best[ext=mp4]/best") -> str:
-        """Get direct stream URL for a YouTube video with fallback formats."""
+        """Get direct stream URL for a YouTube video with fallback formats + Invidious."""
         # Try multiple player clients in order of preference
         player_clients = [
             "android_embedded",
@@ -299,6 +348,43 @@ class YouTubeStreamer:
             logger.info("Available formats for %s:\n%s", url, stdout.decode()[:2000])
         except Exception as e:
             logger.warning("Failed to list formats: %s", e)
+        
+        # Fallback: Try Invidious instances for direct stream URL
+        logger.info("Trying Invidious fallback for stream URL...")
+        video_id = url.split("v=")[-1].split("&")[0]
+        invidious_instances = [
+            "https://yewtu.be",
+            "https://invidious.snopyta.org",
+            "https://invidious.nerdvpn.de",
+        ]
+        
+        for instance in invidious_instances:
+            try:
+                invidious_url = f"{instance}/api/v1/videos/{video_id}"
+                import aiohttp
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(invidious_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                        if resp.status == 200:
+                            import json
+                            data = await resp.json()
+                            # Find best mp4 format
+                            best_url = None
+                            for fmt in data.get("adaptiveFormats", []):
+                                if fmt.get("mimeType", "").startswith("video/") and fmt.get("url"):
+                                    best_url = fmt["url"]
+                                    break
+                            if not best_url:
+                                for fmt in data.get("adaptiveFormats", []):
+                                    if fmt.get("url"):
+                                        best_url = fmt["url"]
+                                        break
+                            if best_url:
+                                logger.info("Got stream URL from Invidious: %s", instance)
+                                self._cleanup_cookies()
+                                return best_url
+            except Exception as e:
+                logger.warning("Invidious stream %s failed: %s", instance, e)
+                continue
         
         self._cleanup_cookies()
         raise Exception(f"All format attempts failed. Last error: {last_error}")
