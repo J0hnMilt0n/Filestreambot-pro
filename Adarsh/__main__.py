@@ -96,38 +96,11 @@ async def start_services():
 
     app_runner = None
     ping_task = None
+    bot_init_task = None
 
     try:
 
-        # Initialize Telegram clients
-        print("\n")
-        print("------------------- Initializing Telegram Bot -------------------")
-
-        await initialize_clients()
-
-        print("------------------------------ DONE ------------------------------")
-        print()
-
-        # Verify bot is working with a health check
-        try:
-            bot_info = await StreamBot.get_me()
-            StreamBot.username = bot_info.username
-            logging.info("Bot health check passed: @%s", bot_info.username)
-        except Exception as e:
-            logging.error("Bot health check failed: %s", e)
-            raise RuntimeError("Bot initialization verification failed") from e
-
-        # Initialize plugins
-        await load_plugins()
-
-        # Keep Alive
-        if Var.ON_HEROKU:
-
-            print("------------------ Starting Keep Alive Service ------------------")
-
-            ping_task = asyncio.create_task(ping_server())
-
-        # Start web server
+        # Start web server FIRST (so health checks pass immediately)
         print("-------------------- Initializing Web Server --------------------")
 
         app = await web_server()
@@ -160,9 +133,7 @@ async def start_services():
 
         print("----------------------- Service Started -------------------------")
 
-        print(f"Bot        =>> {bot_info.first_name}")
         print(f"Server IP  =>> {bind_address}:{Var.PORT}")
-        print(f"Owner      =>> {Var.OWNER_USERNAME}")
 
         if Var.ON_HEROKU:
             print(f"App URL    =>> {Var.FQDN}")
@@ -175,6 +146,62 @@ async def start_services():
         )
 
         print("------------------------------------------------------------------")
+
+        # Initialize Telegram clients in BACKGROUND with retries
+        print("\n")
+        print("------------------- Initializing Telegram Bot -------------------")
+
+        async def init_bot_with_retry():
+            max_retries = 5
+            base_delay = 30  # Start with 30s for Telegram internal issues
+            
+            for attempt in range(1, max_retries + 1):
+                try:
+                    logging.info("Starting main bot (attempt %s/%s)", attempt, max_retries)
+                    
+                    await initialize_clients()
+                    
+                    # Verify bot is working
+                    bot_info = await StreamBot.get_me()
+                    StreamBot.username = bot_info.username
+                    logging.info("Bot health check passed: @%s", bot_info.username)
+                    
+                    # Initialize plugins after successful bot connection
+                    await load_plugins()
+                    
+                    print("------------------------------ DONE ------------------------------")
+                    print()
+                    print(f"Bot        =>> {bot_info.first_name}")
+                    print(f"Owner      =>> {Var.OWNER_USERNAME}")
+                    print("------------------------------------------------------------------")
+                    return
+                    
+                except Exception as e:
+                    logging.warning("Main bot startup failed (attempt %s/%s): %s", attempt, max_retries, e)
+                    
+                    try:
+                        await StreamBot.disconnect()
+                    except Exception:
+                        pass
+                    
+                    if attempt == max_retries:
+                        logging.error("All bot initialization attempts failed")
+                        return
+                    
+                    # Exponential backoff: 30s, 60s, 120s, 120s, 120s
+                    delay = min(base_delay * (2 ** (attempt - 1)), 120)
+                    logging.info("Waiting %ss before retry...", delay)
+                    await asyncio.sleep(delay)
+
+        # Start bot initialization in background
+        bot_init_task = asyncio.create_task(init_bot_with_retry())
+
+        # Keep Alive
+        if Var.ON_HEROKU:
+
+            print("------------------ Starting Keep Alive Service ------------------")
+
+            ping_task = asyncio.create_task(ping_server())
 
         # Keep the application alive
         await asyncio.Event().wait()
@@ -192,6 +219,15 @@ async def start_services():
     finally:
 
         logging.info("Shutting down services...")
+
+        if bot_init_task and not bot_init_task.done():
+            bot_init_task.cancel()
+            try:
+                await bot_init_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logging.exception("Bot init shutdown error")
 
         if ping_task:
             ping_task.cancel()
