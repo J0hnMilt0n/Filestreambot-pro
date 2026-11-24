@@ -1,25 +1,16 @@
 
-import math
 import asyncio
 import logging
 
 from typing import Dict, Union
-
-from Adarsh.vars import Var
-from Adarsh.bot import work_loads
 
 from pyrogram import Client, utils, raw
 from pyrogram.session import Session, Auth
 from pyrogram.errors import (
     AuthBytesInvalid,
     FloodWait,
-    RPCError,
-    Timeout
+    RPCError
 )
-
-from .file_properties import get_file_ids
-
-from Adarsh.server.exceptions import FIleNotFound
 
 from pyrogram.file_id import (
     FileId,
@@ -27,30 +18,33 @@ from pyrogram.file_id import (
     ThumbnailSource
 )
 
+from Adarsh.vars import Var
+from Adarsh.bot import work_loads
+from Adarsh.server.exceptions import FIleNotFound
+
+from .file_properties import get_file_ids
+
 
 class ByteStreamer:
 
     def __init__(self, client: Client):
-
         self.clean_timer = 30 * 60
+
         self.client: Client = client
 
         self.cached_file_ids: Dict[int, FileId] = {}
 
-        asyncio.create_task(self.clean_cache())
+        self._cache_lock = asyncio.Lock()
+        self._session_locks = {}
 
-    # --------------------------------------------
-    # FILE PROPERTIES
-    # --------------------------------------------
+        asyncio.create_task(self.clean_cache())
 
     async def get_file_properties(self, id: int) -> FileId:
 
         if id not in self.cached_file_ids:
-            await self.generate_file_properties(id)
-
-            logging.debug(
-                f"Cached file properties for message ID {id}"
-            )
+            async with self._cache_lock:
+                if id not in self.cached_file_ids:
+                    await self.generate_file_properties(id)
 
         return self.cached_file_ids[id]
 
@@ -64,21 +58,19 @@ class ByteStreamer:
 
         if not file_id:
             logging.error(
-                f"Message with ID {id} not found"
+                "File not found. Message ID: %s",
+                id
             )
             raise FIleNotFound
 
         self.cached_file_ids[id] = file_id
 
         logging.debug(
-            f"Generated file properties for message ID {id}"
+            "Cached file properties for message ID %s",
+            id
         )
 
         return file_id
-
-    # --------------------------------------------
-    # MEDIA SESSION
-    # --------------------------------------------
 
     async def generate_media_session(
         self,
@@ -86,103 +78,105 @@ class ByteStreamer:
         file_id: FileId
     ) -> Session:
 
-        media_session = client.media_sessions.get(
-            file_id.dc_id
-        )
+        dc_id = file_id.dc_id
+
+        media_session = client.media_sessions.get(dc_id)
 
         if media_session is not None:
-            if media_session.is_connected:
+            return media_session
+
+        if dc_id not in self._session_locks:
+            self._session_locks[dc_id] = asyncio.Lock()
+
+        async with self._session_locks[dc_id]:
+
+            media_session = client.media_sessions.get(dc_id)
+
+            if media_session is not None:
                 return media_session
 
-            logging.warning(
-                f"Media session disconnected for DC {file_id.dc_id}"
-            )
+            test_mode = await client.storage.test_mode()
 
-            try:
-                await media_session.stop()
-            except Exception:
-                logging.exception("Error stopping old media session")
+            if dc_id != await client.storage.dc_id():
 
-            client.media_sessions.pop(file_id.dc_id, None)
+                auth_key = await Auth(
+                    client,
+                    dc_id,
+                    test_mode
+                ).create()
 
-        if file_id.dc_id != await client.storage.dc_id():
+            else:
+                auth_key = await client.storage.auth_key()
 
             media_session = Session(
                 client,
-                file_id.dc_id,
-                await Auth(
-                    client,
-                    file_id.dc_id,
-                    await client.storage.test_mode()
-                ).create(),
-                await client.storage.test_mode(),
+                dc_id,
+                auth_key,
+                test_mode,
                 is_media=True
             )
 
-            await media_session.start()
-
             try:
 
-                for attempt in range(6):
+                await media_session.start()
 
-                    exported_auth = await client.invoke(
-                        raw.functions.auth.ExportAuthorization(
-                            dc_id=file_id.dc_id
-                        )
-                    )
+                if dc_id != await client.storage.dc_id():
 
-                    try:
+                    authorized = False
 
-                        await media_session.send(
-                            raw.functions.auth.ImportAuthorization(
-                                id=exported_auth.id,
-                                bytes=exported_auth.bytes
+                    for attempt in range(5):
+
+                        exported_auth = await client.invoke(
+                            raw.functions.auth.ExportAuthorization(
+                                dc_id=dc_id
                             )
                         )
 
-                        break
+                        try:
 
-                    except AuthBytesInvalid:
+                            await media_session.send(
+                                raw.functions.auth.ImportAuthorization(
+                                    id=exported_auth.id,
+                                    bytes=exported_auth.bytes
+                                )
+                            )
 
-                        logging.warning(
-                            f"Invalid authorization bytes for DC "
-                            f"{file_id.dc_id}, attempt {attempt + 1}"
-                        )
+                            authorized = True
+                            break
 
-                        await asyncio.sleep(1)
+                        except AuthBytesInvalid:
 
-                else:
+                            logging.warning(
+                                "Invalid authorization bytes for DC %s",
+                                dc_id
+                            )
 
-                    raise AuthBytesInvalid
+                            await asyncio.sleep(
+                                min(2 ** attempt, 10)
+                            )
+
+                    if not authorized:
+                        raise AuthBytesInvalid
+
+                client.media_sessions[dc_id] = media_session
+
+                logging.info(
+                    "Media session created for DC %s",
+                    dc_id
+                )
+
+                return media_session
 
             except Exception:
 
-                await media_session.stop()
+                try:
+                    await media_session.stop()
+                except Exception:
+                    logging.exception(
+                        "Failed to stop media session"
+                    )
+
                 raise
-
-        else:
-
-            media_session = Session(
-                client,
-                file_id.dc_id,
-                await client.storage.auth_key(),
-                await client.storage.test_mode(),
-                is_media=True
-            )
-
-            await media_session.start()
-
-        client.media_sessions[file_id.dc_id] = media_session
-
-        logging.info(
-            f"Created media session for DC {file_id.dc_id}"
-        )
-
-        return media_session
-
-    # --------------------------------------------
-    # FILE LOCATION
-    # --------------------------------------------
 
     @staticmethod
     async def get_location(
@@ -204,22 +198,20 @@ class ByteStreamer:
                     access_hash=file_id.chat_access_hash
                 )
 
+            elif file_id.chat_access_hash == 0:
+
+                peer = raw.types.InputPeerChat(
+                    chat_id=-file_id.chat_id
+                )
+
             else:
 
-                if file_id.chat_access_hash == 0:
-
-                    peer = raw.types.InputPeerChat(
-                        chat_id=-file_id.chat_id
-                    )
-
-                else:
-
-                    peer = raw.types.InputPeerChannel(
-                        channel_id=utils.get_channel_id(
-                            file_id.chat_id
-                        ),
-                        access_hash=file_id.chat_access_hash
-                    )
+                peer = raw.types.InputPeerChannel(
+                    channel_id=utils.get_channel_id(
+                        file_id.chat_id
+                    ),
+                    access_hash=file_id.chat_access_hash
+                )
 
             location = raw.types.InputPeerPhotoFileLocation(
                 peer=peer,
@@ -251,9 +243,68 @@ class ByteStreamer:
 
         return location
 
-    # --------------------------------------------
-    # STREAM FILE
-    # --------------------------------------------
+    async def get_file_with_retry(
+        self,
+        media_session,
+        location,
+        offset,
+        chunk_size,
+        retries=5
+    ):
+
+        for attempt in range(retries):
+
+            try:
+
+                return await media_session.send(
+                    raw.functions.upload.GetFile(
+                        location=location,
+                        offset=offset,
+                        limit=chunk_size
+                    )
+                )
+
+            except FloodWait as e:
+
+                logging.warning(
+                    "Telegram FloodWait: %s seconds",
+                    e.value
+                )
+
+                await asyncio.sleep(e.value)
+
+            except RPCError as e:
+
+                if attempt == retries - 1:
+                    raise
+
+                delay = min(2 ** attempt, 15)
+
+                logging.warning(
+                    "Telegram RPC error: %s. Retrying in %s seconds",
+                    e,
+                    delay
+                )
+
+                await asyncio.sleep(delay)
+
+            except asyncio.TimeoutError:
+
+                if attempt == retries - 1:
+                    raise
+
+                delay = min(2 ** attempt, 15)
+
+                logging.warning(
+                    "Telegram timeout. Retrying in %s seconds",
+                    delay
+                )
+
+                await asyncio.sleep(delay)
+
+        raise asyncio.TimeoutError(
+            "Telegram file request failed"
+        )
 
     async def yield_file(
         self,
@@ -264,7 +315,7 @@ class ByteStreamer:
         last_part_cut: int,
         part_count: int,
         chunk_size: int
-    ) -> Union[str, None]:
+    ):
 
         work_loads[index] += 1
 
@@ -272,12 +323,10 @@ class ByteStreamer:
 
         try:
 
-            logging.info(
-                f"Starting file streaming with client {index}"
-            )
+            client = self.client
 
             media_session = await self.generate_media_session(
-                self.client,
+                client,
                 file_id
             )
 
@@ -285,71 +334,27 @@ class ByteStreamer:
 
             while current_part <= part_count:
 
-                retries = 0
-                max_retries = 3
-
-                while True:
-
-                    try:
-
-                        r = await media_session.send(
-                            raw.functions.upload.GetFile(
-                                location=location,
-                                offset=offset,
-                                limit=chunk_size
-                            )
-                        )
-
-                        break
-
-                    except FloodWait as e:
-
-                        wait_time = e.value
-
-                        logging.warning(
-                            f"Telegram FloodWait: {wait_time}s"
-                        )
-
-                        await asyncio.sleep(wait_time)
-
-                    except (Timeout, asyncio.TimeoutError) as e:
-
-                        retries += 1
-
-                        logging.warning(
-                            f"Telegram timeout: attempt "
-                            f"{retries}/{max_retries}"
-                        )
-
-                        if retries >= max_retries:
-                            raise
-
-                        await asyncio.sleep(2 ** retries)
-
-                    except RPCError as e:
-
-                        logging.error(
-                            f"Telegram RPC error: {e}"
-                        )
-
-                        raise
+                r = await self.get_file_with_retry(
+                    media_session,
+                    location,
+                    offset,
+                    chunk_size
+                )
 
                 if not isinstance(r, raw.types.upload.File):
 
                     logging.error(
-                        "Telegram returned an unexpected file response"
+                        "Unexpected Telegram file response"
                     )
 
-                    raise RuntimeError(
-                        "Invalid Telegram file response"
-                    )
+                    break
 
                 chunk = r.bytes
 
                 if not chunk:
                     break
 
-                if current_part == 1 and part_count == 1:
+                if part_count == 1:
 
                     yield chunk[
                         first_part_cut:last_part_cut
@@ -373,7 +378,7 @@ class ByteStreamer:
         except asyncio.CancelledError:
 
             logging.info(
-                "File streaming cancelled by client"
+                "File streaming cancelled"
             )
 
             raise
@@ -388,18 +393,15 @@ class ByteStreamer:
 
         finally:
 
-            logging.info(
-                f"Finished streaming after {current_part - 1} parts"
+            logging.debug(
+                "Finished streaming after %s parts",
+                current_part - 1
             )
 
             work_loads[index] = max(
                 0,
                 work_loads[index] - 1
             )
-
-    # --------------------------------------------
-    # CACHE CLEANER
-    # --------------------------------------------
 
     async def clean_cache(self):
 
