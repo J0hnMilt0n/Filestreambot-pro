@@ -33,6 +33,11 @@ class YouTubeStreamer:
 
     def _prepare_cookies(self) -> Optional[str]:
         """Prepare cookie file from env var or existing file. Returns path or None."""
+        # If cookies were invalidated, don't try again
+        if self._cookies_invalidated:
+            logger.debug("Cookies invalidated, skipping cookie preparation")
+            return None
+        
         # Priority 1: Cookie content from env var (write to temp file)
         if self.cookie_content:
             import tempfile
