@@ -269,7 +269,32 @@ async def media_streamer(request):
             text="Internal streaming error",
             status=500
         )
+async def health_check(request):
+    """Health check endpoint for container orchestration."""
+    return web.json_response({
+        "status": "healthy",
+        "service": "filestreambot-pro",
+        "clients_connected": len(multi_clients)
+    })
+
+
+async def readiness_check(request):
+    """Readiness check endpoint for container orchestration."""
+    if not multi_clients:
+        return web.json_response({
+            "status": "not_ready",
+            "reason": "No Telegram clients connected"
+        }, status=503)
+    return web.json_response({
+        "status": "ready",
+        "service": "filestreambot-pro",
+        "clients_connected": len(multi_clients)
+    })
+
+
 routes = [
+    web.get("/health", health_check),
+    web.get("/ready", readiness_check),
     web.get("/watch/{id}/{file_name}", media_streamer),
     web.get("/dl/{id}/{file_name}", media_streamer),
 ]

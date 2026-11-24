@@ -6,6 +6,7 @@ import logging
 
 from telethon import TelegramClient
 from telethon.sessions import MemorySession
+from telethon.errors import RpcCallFailError
 import TelethonFakeTLS
 
 from Adarsh.vars import Var
@@ -30,6 +31,14 @@ def create_client(session):
         flood_sleep_threshold=Var.SLEEP_THRESHOLD,
         receive_updates=False
     )
+
+
+def is_telegram_internal_error(error):
+    """Check if the error is a transient Telegram internal issue."""
+    if isinstance(error, RpcCallFailError):
+        error_msg = str(error).lower()
+        return "telegram is having internal issues" in error_msg
+    return False
 
 
 async def initialize_clients():
@@ -63,9 +72,17 @@ async def initialize_clients():
                 if attempt == 5:
                     raise
 
-                await asyncio.sleep(
-                    min(5 * (2 ** (attempt - 1)), 60)
-                )
+                # Use longer delay for Telegram internal issues
+                if is_telegram_internal_error(e):
+                    delay = min(30 * (2 ** (attempt - 1)), 120)
+                    logging.info(
+                        "Telegram internal issue detected, waiting %ss before retry",
+                        delay
+                    )
+                else:
+                    delay = min(5 * (2 ** (attempt - 1)), 60)
+                
+                await asyncio.sleep(delay)
 
     multi_clients[0] = StreamBot
     work_loads[0] = 0
@@ -126,9 +143,17 @@ async def initialize_clients():
                         pass
 
                 if attempt < 5:
-                    await asyncio.sleep(
-                        min(5 * (2 ** (attempt - 1)), 60)
-                    )
+                    # Use longer delay for Telegram internal issues
+                    if is_telegram_internal_error(e):
+                        delay = min(30 * (2 ** (attempt - 1)), 120)
+                        logging.info(
+                            "Telegram internal issue detected, waiting %ss before retry",
+                            delay
+                        )
+                    else:
+                        delay = min(5 * (2 ** (attempt - 1)), 60)
+                    
+                    await asyncio.sleep(delay)
 
         await asyncio.sleep(3)
 

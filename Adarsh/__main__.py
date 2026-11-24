@@ -95,8 +95,14 @@ async def start_services():
         print("------------------------------ DONE ------------------------------")
         print()
 
-        bot_info = await StreamBot.get_me()
-        StreamBot.username = bot_info.username
+        # Verify bot is working with a health check
+        try:
+            bot_info = await StreamBot.get_me()
+            StreamBot.username = bot_info.username
+            logging.info("Bot health check passed: @%s", bot_info.username)
+        except Exception as e:
+            logging.error("Bot health check failed: %s", e)
+            raise RuntimeError("Bot initialization verification failed") from e
 
         # Initialize plugins
         await load_plugins()
