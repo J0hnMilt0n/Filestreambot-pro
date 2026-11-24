@@ -236,6 +236,9 @@ class YouTubeStreamer:
         # SABR experiment requires tv_embedded or android_embedded
         player_clients = ["tv_embedded", "android_embedded", "web_embedded", "web", "default"]
         
+        # Track if cookies are invalid to avoid retrying with them
+        cookies_invalid = False
+        
         # Try with cookies first, then without cookies if cookies fail
         for use_cookies in [True, False]:
             if not use_cookies:
@@ -244,8 +247,8 @@ class YouTubeStreamer:
             for player_client in player_clients:
                 cmd, env = self._get_base_cmd()
                 
-                # Remove cookies if not using them
-                if not use_cookies:
+                # Remove cookies if not using them OR if cookies are invalid
+                if not use_cookies or cookies_invalid:
                     try:
                         idx = cmd.index("--cookies")
                         cmd.pop(idx)
@@ -296,6 +299,11 @@ class YouTubeStreamer:
                     
                     stderr_str = stderr.decode()[:300]
                     logger.warning("Video info failed (client: %s, cookies: %s): %s", player_client, use_cookies, stderr_str)
+                    
+                    # Detect invalid cookies - stop using them
+                    if "sign in to confirm" in stderr_str.lower() or "not a bot" in stderr_str.lower():
+                        cookies_invalid = True
+                        logger.warning("Cookies appear invalid, will skip cookie attempts")
                     
                     # If "no longer supported" error, try next client immediately
                     if "no longer supported" in stderr_str.lower():
@@ -380,6 +388,7 @@ class YouTubeStreamer:
         player_clients = ["tv_embedded", "android_embedded", "web_embedded", "web", "default"]
         # Use explicit format IDs that work without Deno (from --list-formats)
         # These are video+audio combinations that don't require n-challenge solving
+        # Also include m3u8 formats which work without n-challenge
         formats = [
             quality,
             "137+140",  # 1080p video + audio
@@ -388,11 +397,20 @@ class YouTubeStreamer:
             "134+140",  # 360p video + audio
             "133+140",  # 240p video + audio
             "160+140",  # 144p video + audio
+            # m3u8/HLS formats (work without n-challenge)
+            "232+140",  # 720p m3u8 video + audio
+            "231+140",  # 480p m3u8 video + audio
+            "230+140",  # 360p m3u8 video + audio
+            "229+140",  # 240p m3u8 video + audio
+            "269+140",  # 144p m3u8 video + audio
             "best[ext=mp4]/best",
             "best[protocol^=https]/best",
             "best[protocol^=m3u8]/best",
             "best",
         ]
+        
+        # Track if cookies are invalid to avoid retrying with them
+        cookies_invalid = False
         
         # Try with cookies first, then without cookies
         for use_cookies in [True, False]:
@@ -403,8 +421,8 @@ class YouTubeStreamer:
                 for fmt in formats:
                     cmd, env = self._get_base_cmd()
                     
-                    # Remove cookies if not using them
-                    if not use_cookies:
+                    # Remove cookies if not using them OR if cookies are invalid
+                    if not use_cookies or cookies_invalid:
                         try:
                             idx = cmd.index("--cookies")
                             cmd.pop(idx)
@@ -453,9 +471,18 @@ class YouTubeStreamer:
                         stderr_str = stderr.decode()[:300]
                         logger.warning("Format %s (client: %s, cookies: %s) failed: %s", fmt, player_client, use_cookies, stderr_str)
                         
+                        # Detect invalid cookies - stop using them
+                        if "sign in to confirm" in stderr_str.lower() or "not a bot" in stderr_str.lower():
+                            cookies_invalid = True
+                            logger.warning("Cookies appear invalid, will skip cookie attempts")
+                        
                         # If "no longer supported" error, try next client immediately
                         if "no longer supported" in stderr_str.lower():
                             break  # break format loop, try next client
+                        
+                        # If format not available, try next format
+                        if "requested format is not available" in stderr_str.lower():
+                            continue
                         
                     except Exception as e:
                         logger.warning("Format %s (client: %s, cookies: %s) exception: %s", fmt, player_client, use_cookies, e)
