@@ -6,6 +6,7 @@ import re
 from urllib.parse import quote, unquote
 
 from aiohttp import web
+from telethon.errors import AuthKeyUnregisteredError
 
 from Adarsh.bot import multi_clients, work_loads
 from Adarsh.vars import Var
@@ -144,9 +145,9 @@ async def media_streamer(request):
                 status=503
             )
 
-        # Wait for at least one client to be connected (max 10s, faster polling)
-        max_wait = 10
-        wait_interval = 0.5
+        # Wait for at least one client to be connected (max 30s)
+        max_wait = 30
+        wait_interval = 1.0
         waited = 0
         connected = False
         
@@ -169,7 +170,8 @@ async def media_streamer(request):
                 return await stream_youtube_video(request, youtube_url, youtube_id)
             return web.Response(
                 text="Telegram bot not connected yet, please retry in a moment",
-                status=503
+                status=503,
+                headers={"Retry-After": "30"}
             )
 
         # Select the client with the lowest current workload.
@@ -200,6 +202,19 @@ async def media_streamer(request):
         # Try to retrieve Telegram file metadata
         try:
             file_properties = await streamer.get_file_properties(file_id)
+        except AuthKeyUnregisteredError:
+            logger.error("AuthKeyUnregisteredError - Telegram session expired, bot needs re-authentication")
+            # Try YouTube fallback immediately
+            if youtube_id_param and is_youtube_url(youtube_id_param):
+                logger.info("Falling back to YouTube due to expired session: %s", youtube_id_param)
+                youtube_id = extract_youtube_id(youtube_id_param)
+                youtube_url = f"https://www.youtube.com/watch?v={youtube_id}"
+                return await stream_youtube_video(request, youtube_url, youtube_id)
+            return web.Response(
+                text="Telegram session expired, please retry later",
+                status=503,
+                headers={"Retry-After": "30"}
+            )
         except FIleNotFound:
             # Telegram file not found - try YouTube fallback
             if youtube_id_param and is_youtube_url(youtube_id_param):

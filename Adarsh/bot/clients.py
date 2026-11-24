@@ -3,10 +3,11 @@
 
 import asyncio
 import logging
+import os
 
 from telethon import TelegramClient
 from telethon.sessions import MemorySession
-from telethon.errors import RpcCallFailError
+from telethon.errors import RpcCallFailError, AuthKeyUnregisteredError
 import TelethonFakeTLS
 
 # Monkey-patch TelethonFakeTLS to add missing wait_closed method
@@ -81,6 +82,33 @@ def is_telegram_internal_error(error):
     return False
 
 
+def is_auth_key_error(error):
+    """Check if the error is an AuthKeyUnregisteredError (session expired)."""
+    error_msg = str(error).lower()
+    if isinstance(error, AuthKeyUnregisteredError):
+        return True
+    if "authkeyunregistered" in error_msg or "key is not registered" in error_msg:
+        return True
+    return False
+
+
+def cleanup_session_files():
+    """Delete any existing session files to force re-authentication."""
+    session_files = [
+        "bot.session",
+        "bot.session-journal",
+        "/tmp/bot.session",
+        "/tmp/bot.session-journal",
+    ]
+    for sf in session_files:
+        try:
+            if os.path.exists(sf):
+                os.unlink(sf)
+                logging.info("Deleted expired session file: %s", sf)
+        except Exception as e:
+            logging.warning("Failed to delete session file %s: %s", sf, e)
+
+
 async def initialize_clients():
 
     multi_clients.clear()
@@ -106,6 +134,20 @@ async def initialize_clients():
             break
         except Exception as e:
             logging.warning("Main bot startup failed (proxy=%s): %s", use_proxy, e)
+            
+            # Handle AuthKeyUnregisteredError - delete session and retry
+            if is_auth_key_error(e):
+                logging.warning("AuthKeyUnregisteredError detected, cleaning up session files...")
+                cleanup_session_files()
+                # Force reconnection by creating new client
+                try:
+                    await StreamBot.disconnect()
+                except Exception:
+                    pass
+                StreamBot = create_client(MemorySession(), use_proxy=use_proxy)
+                multi_clients[0] = StreamBot
+                continue  # Retry with same proxy setting
+            
             try:
                 await StreamBot.disconnect()
             except Exception:
@@ -145,6 +187,12 @@ async def initialize_clients():
                 break
             except Exception as e:
                 logging.warning("Client %s failed (proxy=%s): %s", client_id, use_proxy, e)
+                
+                # Handle AuthKeyUnregisteredError for additional clients
+                if is_auth_key_error(e):
+                    logging.warning("Client %s: AuthKeyUnregisteredError detected, cleaning up session files...", client_id)
+                    cleanup_session_files()
+                
                 if client is not None:
                     try:
                         await client.disconnect()

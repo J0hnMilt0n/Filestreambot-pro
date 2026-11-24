@@ -111,10 +111,14 @@ class YouTubeStreamer:
 
     async def _get_invidious_info(self, video_id: str) -> Optional[Dict[str, Any]]:
         """Get video info from Invidious instances (fast, no yt-dlp)."""
+        # More reliable Invidious instances (some may be blocked on Koyeb)
         invidious_instances = [
             "https://yewtu.be",
-            "https://invidious.snopyta.org",
             "https://invidious.nerdvpn.de",
+            "https://invidious.snopyta.org",
+            "https://invidious.projectsegfau.lt",
+            "https://invidious.privacydev.net",
+            "https://yewtu.be",
         ]
         
         for instance in invidious_instances:
@@ -156,8 +160,11 @@ class YouTubeStreamer:
         """Get direct stream URL from Invidious (fast, no yt-dlp)."""
         invidious_instances = [
             "https://yewtu.be",
-            "https://invidious.snopyta.org",
             "https://invidious.nerdvpn.de",
+            "https://invidious.snopyta.org",
+            "https://invidious.projectsegfau.lt",
+            "https://invidious.privacydev.net",
+            "https://yewtu.be",
         ]
         
         for instance in invidious_instances:

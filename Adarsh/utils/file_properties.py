@@ -9,6 +9,7 @@ from typing import Any, Optional
 
 from telethon import TelegramClient
 from telethon.tl.types import Document, Photo
+from telethon.errors import AuthKeyUnregisteredError
 
 from Adarsh.server.exceptions import FIleNotFound
 
@@ -117,6 +118,14 @@ async def get_file_ids(
             message,
             media
         )
+    except AuthKeyUnregisteredError:
+        logging.error("AuthKeyUnregisteredError in get_file_ids - session expired")
+        raise
+    except Exception as e:
+        if "AuthKeyUnregistered" in str(e) or "key is not registered" in str(e).lower():
+            logging.error("AuthKeyUnregisteredError detected in get_file_ids: %s", e)
+            raise AuthKeyUnregisteredError("Session expired") from e
+        raise
 
         if not file_size:
             logging.warning(
