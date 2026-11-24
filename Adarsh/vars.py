@@ -26,6 +26,19 @@ class Var(object):
     SLEEP_THRESHOLD = int(getenv("SLEEP_THRESHOLD", "60"))
     WORKERS = int(getenv("WORKERS", "4"))
 
+    # MTProto Proxy Configuration
+    TELEGRAM_PROXY_HOST = getenv(
+        "TELEGRAM_PROXY_HOST", "tg.prxtg.top"
+    )
+
+    TELEGRAM_PROXY_PORT = int(
+        getenv("TELEGRAM_PROXY_PORT", "443")
+    )
+
+    TELEGRAM_PROXY_SECRET = getenv(
+        "TELEGRAM_PROXY_SECRET", ""
+    )
+
     BIN_CHANNEL = int(getenv("BIN_CHANNEL"))
     PORT = int(getenv("PORT", "8080"))
 
@@ -47,7 +60,6 @@ class Var(object):
 
     HAS_SSL = get_bool("HAS_SSL", True)
 
-    # Public hostname
     FQDN = getenv("FQDN", "").strip()
 
     if not FQDN and ON_HEROKU and APP_NAME:
@@ -58,7 +70,6 @@ class Var(object):
             "FQDN is missing! Set FQDN to your public domain name."
         )
 
-    # Remove protocol and trailing slash
     FQDN = (
         FQDN.replace("https://", "")
             .replace("http://", "")
