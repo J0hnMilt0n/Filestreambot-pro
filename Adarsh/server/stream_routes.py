@@ -502,7 +502,13 @@ async def stream_youtube_video(request, youtube_url: str, video_id: str):
         
         except Exception as e:
             logger.exception("YouTube streaming failed for %s: %s", video_id, e)
-            raise
+            # Don't raise - return error response instead
+            if not request.transport or request.transport.is_closing():
+                return web.Response(status=500)
+            return web.Response(
+                text=f"YouTube streaming error: {type(e).__name__}: {e}",
+                status=500
+            )
         
         finally:
             await response.write_eof()

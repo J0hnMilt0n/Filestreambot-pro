@@ -494,7 +494,13 @@ class YouTubeStreamer:
                         logger.warning("Format %s (client: %s, cookies: %s) exception: %s", fmt, player_client, use_cookies, e)
         
         self._cleanup_cookies()
-        raise Exception(f"All stream URL attempts failed for {video_id}")
+        # Provide more context about the failure
+        error_msg = f"All stream URL attempts failed for {video_id}. "
+        if cookies_invalid:
+            error_msg += "Cookies were invalid (bot detection). "
+        error_msg += "Tried: Invidious (6 instances), yt-dlp with player clients [tv_embedded, android_embedded, web_embedded, web, default], formats [explicit IDs, m3u8, best]. "
+        error_msg += "Check: Deno installed for n-challenge, cookies valid, network access to YouTube/Invidious."
+        raise Exception(error_msg)
 
     async def stream_video(
         self,
