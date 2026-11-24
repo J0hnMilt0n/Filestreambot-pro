@@ -1,12 +1,23 @@
+
+# (c) adarsh-goel
+
 import logging
 
-import TelethonFakeTLS
 from telethon import TelegramClient
+import TelethonFakeTLS
 
 from Adarsh.vars import Var
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
 
+# Shared multi-client storage
+multi_clients = {}
+work_loads = {}
+
+# Create main Telegram client
 StreamBot = TelegramClient(
     "Web Streamer",
     Var.API_ID,
@@ -21,3 +32,7 @@ StreamBot = TelegramClient(
     connection_retries=5,
     retry_delay=5
 )
+
+# Register main client
+multi_clients[0] = StreamBot
+work_loads[0] = 0
