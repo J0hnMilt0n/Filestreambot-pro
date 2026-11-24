@@ -2,7 +2,8 @@
 import asyncio
 import logging
 import math
-from urllib.parse import quote
+import re
+from urllib.parse import quote, unquote
 
 from aiohttp import web
 
@@ -10,6 +11,7 @@ from Adarsh.bot import multi_clients, work_loads
 from Adarsh.vars import Var
 from Adarsh.server.exceptions import FIleNotFound
 from Adarsh.utils.custom_dl import ByteStreamer
+from Adarsh.utils.youtube_dl import YouTubeStreamer, get_youtube_streamer
 
 
 logger = logging.getLogger(__name__)
@@ -73,15 +75,38 @@ def parse_range_header(range_header, file_size):
     return start, end
 
 
+# YouTube URL patterns
+YOUTUBE_PATTERNS = [
+    r'(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/embed/|youtube\.com/v/)([a-zA-Z0-9_-]{11})',
+    r'^([a-zA-Z0-9_-]{11})$'  # Direct video ID
+]
+
+def is_youtube_url(text: str) -> bool:
+    """Check if text is a YouTube URL or video ID."""
+    for pattern in YOUTUBE_PATTERNS:
+        if re.match(pattern, text):
+            return True
+    return False
+
+def extract_youtube_id(text: str) -> str:
+    """Extract YouTube video ID from URL or return ID if already an ID."""
+    for pattern in YOUTUBE_PATTERNS:
+        match = re.match(pattern, text)
+        if match:
+            return match.group(1)
+    return text
+
+
 async def media_streamer(request):
     """
-    Stream a Telegram file using Telethon.
+    Stream a Telegram file using Telethon with YouTube fallback.
 
     Expected route parameters:
-        /watch/{id}/{file_name}
-        /dl/{id}/{file_name}
+        /watch/{message_id}/{file_name}
+        /dl/{message_id}/{file_name}
 
-    The message ID is the ID of the file in BIN_CHANNEL.
+    The message_id is the ID of the file in BIN_CHANNEL.
+    Optional query param: ?id=youtube_id_or_url (used as fallback if Telegram file not found)
     """
 
     try:
@@ -90,15 +115,24 @@ async def media_streamer(request):
             or request.match_info.get("file_id")
         )
 
+        # Check for YouTube ID in query parameter (fallback)
+        youtube_id_param = request.query.get("id")
+        
         if not raw_file_id:
             return web.Response(
                 text="Missing file ID",
                 status=400
             )
 
+        # First, try Telegram file streaming
         try:
             file_id = int(raw_file_id)
         except (TypeError, ValueError):
+            # If path ID is not an integer, check if it's a YouTube URL/ID
+            if is_youtube_url(raw_file_id):
+                youtube_id = extract_youtube_id(raw_file_id)
+                youtube_url = f"https://www.youtube.com/watch?v={youtube_id}"
+                return await stream_youtube_video(request, youtube_url, youtube_id)
             return web.Response(
                 text="Invalid file ID",
                 status=400
@@ -118,8 +152,17 @@ async def media_streamer(request):
 
         streamer = get_streamer(index)
 
-        # Retrieve Telegram file metadata.
-        file_properties = await streamer.get_file_properties(file_id)
+        # Try to retrieve Telegram file metadata
+        try:
+            file_properties = await streamer.get_file_properties(file_id)
+        except FIleNotFound:
+            # Telegram file not found - try YouTube fallback
+            if youtube_id_param and is_youtube_url(youtube_id_param):
+                logger.info("Telegram file %s not found, falling back to YouTube: %s", file_id, youtube_id_param)
+                youtube_id = extract_youtube_id(youtube_id_param)
+                youtube_url = f"https://www.youtube.com/watch?v={youtube_id}"
+                return await stream_youtube_video(request, youtube_url, youtube_id)
+            raise  # Re-raise if no YouTube fallback
 
         file_size = int(file_properties.file_size)
 
@@ -270,6 +313,124 @@ async def media_streamer(request):
             text=f"Internal streaming error: {type(e).__name__}: {e}",
             status=500
         )
+
+
+async def stream_youtube_video(request, youtube_url: str, video_id: str):
+    """Stream a YouTube video using yt-dlp."""
+    try:
+        yt_streamer = await get_youtube_streamer()
+        
+        # Get video info for metadata
+        try:
+            info = await yt_streamer.get_video_info(youtube_url)
+            file_name = info.get("title", f"youtube_{video_id}") + ".mp4"
+            mime_type = "video/mp4"
+        except Exception:
+            file_name = f"youtube_{video_id}.mp4"
+            mime_type = "video/mp4"
+        
+        # Determine the requested byte range
+        range_header = request.headers.get("Range")
+        
+        # For YouTube, we don't know exact file size, so we stream without Content-Length
+        # unless we can get it from yt-dlp
+        file_size = None
+        try:
+            info = await yt_streamer.get_video_info(youtube_url)
+            for fmt in info.get("formats", []):
+                if fmt.get("ext") == "mp4" and fmt.get("filesize"):
+                    file_size = fmt["filesize"]
+                    break
+        except Exception:
+            pass
+        
+        start = 0
+        end = file_size - 1 if file_size else None
+        
+        if range_header and file_size:
+            try:
+                start, end = parse_range_header(range_header, file_size)
+            except (ValueError, TypeError):
+                return web.Response(
+                    status=416,
+                    headers={
+                        "Content-Range": f"bytes */{file_size}",
+                        "Accept-Ranges": "bytes"
+                    }
+                )
+        
+        content_length = (end - start + 1) if file_size and end else None
+        
+        status = 206 if range_header else 200
+        
+        headers = {
+            "Content-Type": mime_type,
+            "Accept-Ranges": "bytes",
+            "Content-Disposition": f'inline; filename="{quote(file_name)}"',
+            "Cache-Control": "public, max-age=3600",
+            "X-Content-Type-Options": "nosniff"
+        }
+        
+        if content_length:
+            headers["Content-Length"] = str(content_length)
+        
+        if status == 206 and file_size:
+            headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
+        
+        response = web.StreamResponse(
+            status=status,
+            headers=headers
+        )
+        
+        await response.prepare(request)
+        
+        # Stream video using yt-dlp + ffmpeg
+        chunk_size = 512 * 1024
+        bytes_sent = 0
+        
+        try:
+            async for chunk in yt_streamer.stream_video(
+                youtube_url,
+                start=start,
+                end=end,
+                chunk_size=chunk_size
+            ):
+                if not chunk:
+                    continue
+                
+                if content_length:
+                    remaining = content_length - bytes_sent
+                    if remaining <= 0:
+                        break
+                    if len(chunk) > remaining:
+                        chunk = chunk[:remaining]
+                
+                await response.write(chunk)
+                bytes_sent += len(chunk)
+        
+        except (ConnectionResetError, asyncio.CancelledError):
+            logger.info("Client disconnected while streaming YouTube video %s", video_id)
+            raise
+        
+        except Exception as e:
+            logger.exception("YouTube streaming failed for %s: %s", video_id, e)
+            raise
+        
+        finally:
+            await response.write_eof()
+        
+        return response
+        
+    except Exception as e:
+        logger.exception("YouTube stream error: %s", e)
+        if not request.transport or request.transport.is_closing():
+            return web.Response(status=500)
+        return web.Response(
+            text=f"YouTube streaming error: {type(e).__name__}: {e}",
+            status=500
+        )
+
+
 async def health_check(request):
     """Health check endpoint for container orchestration."""
     return web.json_response({
