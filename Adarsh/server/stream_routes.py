@@ -225,7 +225,12 @@ async def media_streamer(request):
                 f'inline; filename="{quote(file_name)}"'
             ),
             "Cache-Control": "public, max-age=86400",
-            "X-Content-Type-Options": "nosniff"
+            "X-Content-Type-Options": "nosniff",
+            # CORS headers for video element
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+            "Access-Control-Allow-Headers": "Range, Content-Type",
+            "Access-Control-Expose-Headers": "Content-Length, Content-Range, Accept-Ranges",
         }
 
         if status == 206:
@@ -368,7 +373,12 @@ async def stream_youtube_video(request, youtube_url: str, video_id: str):
             "Accept-Ranges": "bytes",
             "Content-Disposition": f'inline; filename="{quote(file_name)}"',
             "Cache-Control": "public, max-age=3600",
-            "X-Content-Type-Options": "nosniff"
+            "X-Content-Type-Options": "nosniff",
+            # CORS headers for video element
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+            "Access-Control-Allow-Headers": "Range, Content-Type",
+            "Access-Control-Expose-Headers": "Content-Length, Content-Range, Accept-Ranges",
         }
         
         if content_length:
@@ -454,9 +464,24 @@ async def readiness_check(request):
     })
 
 
+async def options_handler(request):
+    """Handle CORS preflight requests."""
+    return web.Response(
+        status=200,
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+            "Access-Control-Allow-Headers": "Range, Content-Type",
+            "Access-Control-Max-Age": "86400",
+        }
+    )
+
+
 routes = [
     web.get("/health", health_check),
     web.get("/ready", readiness_check),
     web.get("/watch/{id}/{file_name}", media_streamer),
     web.get("/dl/{id}/{file_name}", media_streamer),
+    web.options("/watch/{id}/{file_name}", options_handler),
+    web.options("/dl/{id}/{file_name}", options_handler),
 ]
