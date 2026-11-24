@@ -381,63 +381,21 @@ async def media_streamer(request):
 
 
 async def stream_youtube_video(request, youtube_url: str, video_id: str):
-    """Stream a YouTube video using yt-dlp."""
+    """Stream a YouTube video using yt-dlp.
+
+    IMPORTANT: Response headers are sent IMMEDIATELY (before the slow yt-dlp
+    extraction) so Koyeb's load balancer doesn't return 502 while we wait
+    for Invidious/yt-dlp to resolve the stream URL.
+    """
     try:
         yt_streamer = await get_youtube_streamer()
-        
-        # Get video info for metadata
-        try:
-            info = await yt_streamer.get_video_info(youtube_url)
-            file_name = info.get("title", f"youtube_{video_id}") + ".mp4"
-            mime_type = "video/mp4"
-        except Exception:
-            file_name = f"youtube_{video_id}.mp4"
-            mime_type = "video/mp4"
-        
-        # Determine the requested byte range
-        range_header = request.headers.get("Range")
-        
-        # For YouTube, we don't know exact file size, so we stream without Content-Length
-        # unless we can get it from yt-dlp
-        file_size = None
-        try:
-            info = await yt_streamer.get_video_info(youtube_url)
-            for fmt in info.get("formats", []):
-                if fmt.get("ext") == "mp4" and fmt.get("filesize"):
-                    file_size = fmt["filesize"]
-                    break
-        except Exception:
-            pass
-        
-        # If no file_size, we can't support range requests - return 200 with no Content-Length
-        # This allows video playback but no seeking
-        if file_size is None and range_header:
-            logger.warning("YouTube video %s: file size unknown, ignoring Range header", video_id)
-            range_header = None
-        
-        start = 0
-        end = file_size - 1 if file_size else None
-        
-        if range_header and file_size:
-            try:
-                start, end = parse_range_header(range_header, file_size)
-            except (ValueError, TypeError):
-                return web.Response(
-                    status=416,
-                    headers={
-                        "Content-Range": f"bytes */{file_size}",
-                        "Accept-Ranges": "bytes"
-                    }
-                )
-        
-        content_length = (end - start + 1) if file_size and end else None
-        
-        status = 206 if range_header else 200
-        
+
+        # Send response headers IMMEDIATELY - no Content-Length (unknown size).
+        # This prevents Koyeb LB 502 timeouts during slow URL extraction.
         headers = {
-            "Content-Type": mime_type,
-            "Accept-Ranges": "bytes" if file_size else "none",
-            "Content-Disposition": f'inline; filename="{quote(file_name)}"',
+            "Content-Type": "video/mp4",
+            "Accept-Ranges": "none",
+            "Content-Disposition": f'inline; filename="youtube_{video_id}.mp4"',
             "Cache-Control": "public, max-age=3600",
             "X-Content-Type-Options": "nosniff",
             # CORS headers for video element
@@ -446,34 +404,21 @@ async def stream_youtube_video(request, youtube_url: str, video_id: str):
             "Access-Control-Allow-Headers": "Range, Content-Type",
             "Access-Control-Expose-Headers": "Content-Length, Content-Range, Accept-Ranges",
         }
-        
-        if content_length:
-            headers["Content-Length"] = str(content_length)
-        
-        if status == 206 and file_size:
-            headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
-        
-        response = web.StreamResponse(
-            status=status,
-            headers=headers
-        )
-        
+
+        response = web.StreamResponse(status=200, headers=headers)
         await response.prepare(request)
-        
-        # Stream video using yt-dlp + ffmpeg
-        chunk_size = 512 * 1024
-        bytes_sent = 0
-        
+
+        # Now do the slow extraction (Invidious + yt-dlp fallbacks).
+        # This can take minutes - but headers are already sent, so no 502.
         try:
-            # Add timeout to prevent infinite loading
             stream_gen = yt_streamer.stream_video(
                 youtube_url,
-                start=start,
-                end=end,
-                chunk_size=chunk_size
+                start=0,
+                end=None,
+                chunk_size=512 * 1024
             )
-            
-            # Use asyncio.wait_for with a reasonable timeout for each chunk
+
+            bytes_sent = 0
             while True:
                 try:
                     chunk = await asyncio.wait_for(stream_gen.__anext__(), timeout=30.0)
@@ -482,39 +427,34 @@ async def stream_youtube_video(request, youtube_url: str, video_id: str):
                 except asyncio.TimeoutError:
                     logger.warning("YouTube stream timeout for %s, closing", video_id)
                     break
-                
+
                 if not chunk:
                     continue
-                
-                if content_length:
-                    remaining = content_length - bytes_sent
-                    if remaining <= 0:
-                        break
-                    if len(chunk) > remaining:
-                        chunk = chunk[:remaining]
-                
+
                 await response.write(chunk)
                 bytes_sent += len(chunk)
-        
+
+            logger.info("YouTube stream complete for %s: %s bytes sent", video_id, bytes_sent)
+
         except (ConnectionResetError, asyncio.CancelledError):
             logger.info("Client disconnected while streaming YouTube video %s", video_id)
             raise
-        
+
         except Exception as e:
             logger.exception("YouTube streaming failed for %s: %s", video_id, e)
-            # Don't raise - return error response instead
-            if not request.transport or request.transport.is_closing():
-                return web.Response(status=500)
-            return web.Response(
-                text=f"YouTube streaming error: {type(e).__name__}: {e}",
-                status=500
-            )
-        
+            # Headers already sent - can't change status. Write error as body.
+            try:
+                await response.write(
+                    f"YouTube streaming error: {type(e).__name__}: {e}".encode()
+                )
+            except Exception:
+                pass
+
         finally:
             await response.write_eof()
-        
+
         return response
-        
+
     except Exception as e:
         logger.exception("YouTube stream error: %s", e)
         if not request.transport or request.transport.is_closing():
