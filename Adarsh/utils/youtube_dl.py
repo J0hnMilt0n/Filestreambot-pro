@@ -33,9 +33,11 @@ class YouTubeStreamer:
 
     def _prepare_cookies(self) -> Optional[str]:
         """Prepare cookie file from env var or existing file. Returns path or None."""
+        logger.info("_prepare_cookies called: _cookies_invalidated=%s, cookie_content_set=%s, cookie_file=%s", 
+                    self._cookies_invalidated, bool(self.cookie_content), self.cookie_file)
         # If cookies were invalidated, don't try again
         if self._cookies_invalidated:
-            logger.debug("Cookies invalidated, skipping cookie preparation")
+            logger.info("Cookies invalidated, skipping cookie preparation")
             return None
         
         # Priority 1: Cookie content from env var (write to temp file)
@@ -46,7 +48,7 @@ class YouTubeStreamer:
             )
             self._cookie_temp_file.write(self.cookie_content)
             self._cookie_temp_file.close()
-            logger.info("Using YouTube cookies from YOUTUBE_COOKIES env var")
+            logger.info("Using YouTube cookies from YOUTUBE_COOKIES env var (temp: %s)", self._cookie_temp_file.name)
             return self._cookie_temp_file.name
         
         # Priority 2: Base64 encoded cookies from env var (write to temp file)
@@ -60,7 +62,7 @@ class YouTubeStreamer:
                 )
                 self._cookie_temp_file.write(decoded)
                 self._cookie_temp_file.close()
-                logger.info("Using YouTube cookies from YOUTUBE_COOKIES_B64 env var")
+                logger.info("Using YouTube cookies from YOUTUBE_COOKIES_B64 env var (temp: %s)", self._cookie_temp_file.name)
                 return self._cookie_temp_file.name
             except Exception as e:
                 logger.warning("Failed to decode YOUTUBE_COOKIES_B64: %s", e)
@@ -88,10 +90,8 @@ class YouTubeStreamer:
             except http.cookiejar.LoadError as e:
                 logger.warning("Cookie file %s format invalid (LoadError: %s), ignoring", self.cookie_file, e)
                 return None
-            except Exception as e:
-                logger.warning("Cannot read/parse cookie file %s: %s", self.cookie_file, e)
-                return None
         
+        logger.info("No valid cookie source found, proceeding without cookies")
         return None
 
     def _cleanup_cookies(self):
@@ -334,8 +334,11 @@ class YouTubeStreamer:
                         idx = cmd.index("--cookies")
                         cmd.pop(idx)
                         cmd.pop(idx)
+                        logger.debug("Removed --cookies from cmd (use_cookies=%s, invalidated=%s)", use_cookies, self._cookies_invalidated)
                     except ValueError:
                         pass
+                
+                logger.debug("Trying video info: client=%s, cookies=%s, invalidated=%s", player_client, use_cookies, self._cookies_invalidated)
                 
                 if player_client == "default":
                     try:
@@ -526,8 +529,11 @@ class YouTubeStreamer:
                             idx = cmd.index("--cookies")
                             cmd.pop(idx)
                             cmd.pop(idx)
+                            logger.debug("Removed --cookies from cmd (use_cookies=%s, invalidated=%s)", use_cookies, self._cookies_invalidated)
                         except ValueError:
                             pass
+                    
+                    logger.debug("Trying format: %s, client: %s, cookies: %s, invalidated: %s", fmt, player_client, use_cookies, self._cookies_invalidated)
                     
                     if player_client == "default":
                         try:
@@ -597,10 +603,11 @@ class YouTubeStreamer:
         self._cleanup_cookies()
         # Provide more context about the failure
         error_msg = f"All stream URL attempts failed for {video_id}. "
-        if cookies_invalid:
+        if self._cookies_invalidated:
             error_msg += "Cookies were invalid (bot detection). "
         error_msg += "Tried: Invidious (6 instances), yt-dlp with player clients [tv_embedded, android_embedded, web_embedded, web, default], formats [explicit IDs, m3u8, best]. "
         error_msg += "Check: Deno installed for n-challenge, cookies valid, network access to YouTube/Invidious."
+        logger.error(error_msg)
         raise Exception(error_msg)
 
     async def stream_video(
