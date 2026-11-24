@@ -56,7 +56,14 @@ class YouTubeStreamer:
             self._cookie_temp_file = None
 
     def _get_base_cmd(self):
-        """Base yt-dlp command with anti-bot options."""
+        """Base yt-dlp command with anti-bot options and SABR support."""
+        # Ensure Deno is in PATH for n challenge solving (YouTube SABR experiment)
+        import os
+        env = os.environ.copy()
+        deno_path = "/root/.deno/bin"
+        if deno_path not in env.get("PATH", ""):
+            env["PATH"] = deno_path + ":" + env.get("PATH", "")
+        
         cmd = [
             self.yt_dlp_path,
             "--no-check-certificates",
@@ -64,7 +71,9 @@ class YouTubeStreamer:
             "--ignore-errors",
             "--extractor-retries", "3",
             "--socket-timeout", "30",
-            "--extractor-args", "youtube:player_client=android_embedded",
+            # Use player clients that support SABR (Segmented Adaptive Bitrate)
+            # tv_embedded and android_embedded are known to work with SABR
+            "--extractor-args", "youtube:player_client=tv_embedded,android_embedded",
             # Age-gate bypass
             "--age-limit", "99",
             # NOTE: Removed --extractor-args youtube:skip=hls,dash
@@ -80,7 +89,7 @@ class YouTubeStreamer:
         if cookie_path:
             cmd.extend(["--cookies", cookie_path])
         
-        return cmd
+        return cmd, env
 
     async def _check_ffmpeg(self) -> bool:
         """Check if ffmpeg is available."""
@@ -213,10 +222,10 @@ class YouTubeStreamer:
         
         # Fallback to yt-dlp with limited attempts
         logger.info("Invidious failed, trying yt-dlp for video info...")
-        player_clients = ["android_embedded", "tv_embedded", "web_embedded", "web", "default"]
+        player_clients = ["tv_embedded", "android_embedded", "web_embedded", "web", "default"]
         
         for player_client in player_clients:
-            cmd = self._get_base_cmd()
+            cmd, env = self._get_base_cmd()
             
             if player_client == "default":
                 try:
@@ -238,7 +247,8 @@ class YouTubeStreamer:
                 proc = await asyncio.create_subprocess_exec(
                     *cmd,
                     stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
+                    stderr=asyncio.subprocess.PIPE,
+                    env=env
                 )
                 try:
                     stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30.0)
@@ -324,12 +334,13 @@ class YouTubeStreamer:
         
         # Fallback to yt-dlp with limited attempts
         logger.info("Invidious failed, trying yt-dlp for stream URL...")
-        player_clients = ["android_embedded", "default"]
+        # Use player clients that support SABR
+        player_clients = ["tv_embedded", "android_embedded", "default"]
         formats = [quality, "best[ext=mp4]/best", "best[protocol^=http]/best", "best"]
         
         for player_client in player_clients:
             for fmt in formats:
-                cmd = self._get_base_cmd()
+                cmd, env = self._get_base_cmd()
                 
                 if player_client == "default":
                     try:
@@ -351,7 +362,8 @@ class YouTubeStreamer:
                     proc = await asyncio.create_subprocess_exec(
                         *cmd,
                         stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE
+                        stderr=asyncio.subprocess.PIPE,
+                        env=env
                     )
                     try:
                         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30.0)
@@ -375,37 +387,6 @@ class YouTubeStreamer:
         
         self._cleanup_cookies()
         raise Exception(f"All stream URL attempts failed for {video_id}")
-        
-        for instance in invidious_instances:
-            try:
-                invidious_url = f"{instance}/api/v1/videos/{video_id}"
-                import aiohttp
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(invidious_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                        if resp.status == 200:
-                            import json
-                            data = await resp.json()
-                            # Find best mp4 format
-                            best_url = None
-                            for fmt in data.get("adaptiveFormats", []):
-                                if fmt.get("mimeType", "").startswith("video/") and fmt.get("url"):
-                                    best_url = fmt["url"]
-                                    break
-                            if not best_url:
-                                for fmt in data.get("adaptiveFormats", []):
-                                    if fmt.get("url"):
-                                        best_url = fmt["url"]
-                                        break
-                            if best_url:
-                                logger.info("Got stream URL from Invidious: %s", instance)
-                                self._cleanup_cookies()
-                                return best_url
-            except Exception as e:
-                logger.warning("Invidious stream %s failed: %s", instance, e)
-                continue
-        
-        self._cleanup_cookies()
-        raise Exception(f"All format attempts failed. Last error: {last_error}")
 
     async def stream_video(
         self,
