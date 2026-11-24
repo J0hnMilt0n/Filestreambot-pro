@@ -419,13 +419,21 @@ async def stream_youtube_video(request, youtube_url: str, video_id: str):
             )
 
             bytes_sent = 0
+            first_chunk = True
             while True:
                 try:
-                    chunk = await asyncio.wait_for(stream_gen.__anext__(), timeout=30.0)
+                    # First chunk includes URL extraction time (Invidious + yt-dlp) - allow more time
+                    # Subsequent chunks are just network reads - shorter timeout
+                    timeout = 120.0 if first_chunk else 30.0
+                    chunk = await asyncio.wait_for(stream_gen.__anext__(), timeout=timeout)
+                    first_chunk = False
                 except StopAsyncIteration:
                     break
                 except asyncio.TimeoutError:
-                    logger.warning("YouTube stream timeout for %s, closing", video_id)
+                    if first_chunk:
+                        logger.warning("YouTube stream URL extraction timeout for %s (120s), closing", video_id)
+                    else:
+                        logger.warning("YouTube stream chunk read timeout for %s (30s), closing", video_id)
                     break
 
                 if not chunk:

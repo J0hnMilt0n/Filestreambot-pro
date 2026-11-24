@@ -123,6 +123,31 @@ class YouTubeStreamer:
         
         self._ffmpeg_checked = True
         logger.info("ffmpeg available: %s", self._has_ffmpeg)
+        return self._has_ffmpeg
+
+    async def _check_deno(self) -> bool:
+        """Check if Deno is available for n-challenge solving (SABR experiment)."""
+        if hasattr(self, '_deno_checked') and self._deno_checked:
+            return getattr(self, '_has_deno', False)
+        
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "deno", "--version",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, _ = await proc.communicate()
+            self._has_deno = proc.returncode == 0
+            if self._has_deno:
+                logger.info("Deno available: %s", stdout.decode().strip().split('\n')[0])
+            else:
+                logger.warning("Deno not available - SABR formats (tv_embedded, android_embedded) may fail")
+        except Exception as e:
+            self._has_deno = False
+            logger.warning("Deno check failed: %s - SABR formats may fail", e)
+        
+        self._deno_checked = True
+        return self._has_deno
 
     def _extract_video_id(self, url: str) -> str:
         """Extract video ID from YouTube URL."""
@@ -241,9 +266,17 @@ class YouTubeStreamer:
         
         # Fallback to yt-dlp with limited attempts
         logger.info("Invidious failed, trying yt-dlp for video info...")
-        # Try SABR-compatible clients FIRST (tv_embedded, android_embedded), then web clients
-        # SABR experiment requires tv_embedded or android_embedded
-        player_clients = ["tv_embedded", "android_embedded", "web_embedded", "web", "default"]
+        
+        # Check Deno availability for SABR experiment
+        has_deno = await self._check_deno()
+        
+        # If Deno is available, try SABR clients first; otherwise skip to web clients
+        if has_deno:
+            player_clients = ["tv_embedded", "android_embedded", "web_embedded", "web", "default"]
+            logger.info("Deno available - trying SABR-compatible clients (tv_embedded, android_embedded)")
+        else:
+            player_clients = ["web_embedded", "web", "default"]
+            logger.warning("Deno NOT available - skipping SABR clients (tv_embedded, android_embedded), using web clients")
         
         # Track if cookies are invalid to avoid retrying with them
         cookies_invalid = False
@@ -398,8 +431,18 @@ class YouTubeStreamer:
         
         # Fallback to yt-dlp with limited attempts
         logger.info("Invidious failed, trying yt-dlp for stream URL...")
-        # Try SABR-compatible clients FIRST (tv_embedded, android_embedded), then web clients
-        player_clients = ["tv_embedded", "android_embedded", "web_embedded", "web", "default"]
+        
+        # Check Deno availability for SABR experiment
+        has_deno = await self._check_deno()
+        
+        # If Deno is available, try SABR clients first; otherwise skip to web clients
+        if has_deno:
+            player_clients = ["tv_embedded", "android_embedded", "web_embedded", "web", "default"]
+            logger.info("Deno available - trying SABR-compatible clients (tv_embedded, android_embedded)")
+        else:
+            player_clients = ["web_embedded", "web", "default"]
+            logger.warning("Deno NOT available - skipping SABR clients (tv_embedded, android_embedded), using web clients")
+        
         # Use explicit format IDs that work without Deno (from --list-formats)
         # These are video+audio combinations that don't require n-challenge solving
         # Also include m3u8 formats which work without n-challenge
