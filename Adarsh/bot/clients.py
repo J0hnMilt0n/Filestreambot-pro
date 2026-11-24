@@ -9,6 +9,19 @@ from telethon.sessions import MemorySession
 from telethon.errors import RpcCallFailError
 import TelethonFakeTLS
 
+# Monkey-patch TelethonFakeTLS to add missing wait_closed method
+# This ensures the patch is applied when the connection is actually used
+try:
+    from TelethonFakeTLS.FakeTLS.TLSInOut import FakeTLSStreamWriter
+    if not hasattr(FakeTLSStreamWriter, 'wait_closed'):
+        async def _wait_closed(self):
+            if hasattr(self.upstream, 'wait_closed'):
+                await self.upstream.wait_closed()
+        FakeTLSStreamWriter.wait_closed = _wait_closed
+        logging.getLogger(__name__).info("Patched FakeTLSStreamWriter with wait_closed method")
+except ImportError:
+    pass
+
 from Adarsh.vars import Var
 from Adarsh.utils.config_parser import TokenParser
 from Adarsh.bot import multi_clients, work_loads, StreamBot

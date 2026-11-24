@@ -6,6 +6,19 @@ import asyncio
 import logging
 import importlib.util
 
+# Monkey-patch TelethonFakeTLS to add missing wait_closed method
+# This must be done before importing any telethon modules
+try:
+    from TelethonFakeTLS.FakeTLS.TLSInOut import FakeTLSStreamWriter
+    if not hasattr(FakeTLSStreamWriter, 'wait_closed'):
+        async def _wait_closed(self):
+            if hasattr(self.upstream, 'wait_closed'):
+                await self.upstream.wait_closed()
+        FakeTLSStreamWriter.wait_closed = _wait_closed
+        logging.getLogger(__name__).info("Patched FakeTLSStreamWriter with wait_closed method")
+except ImportError:
+    pass  # TelethonFakeTLS not installed yet, will be patched on next import
+
 from pathlib import Path
 from aiohttp import web
 
