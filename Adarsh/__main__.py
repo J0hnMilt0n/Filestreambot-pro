@@ -28,6 +28,13 @@ from .vars import Var
 from .server import web_server
 from .utils.keepalive import ping_server
 
+# Log masked token for verification (first 10 chars + last 4)
+if Var.BOT_TOKEN:
+    masked = Var.BOT_TOKEN[:10] + "..." + Var.BOT_TOKEN[-4:] if len(Var.BOT_TOKEN) > 14 else "***"
+    logging.info("BOT_TOKEN loaded: %s", masked)
+else:
+    logging.error("BOT_TOKEN not set!")
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -152,12 +159,14 @@ async def start_services():
         print("------------------- Initializing Telegram Bot -------------------")
 
         async def init_bot_with_retry():
-            max_retries = 5
+            max_retries = 10  # Increased for persistent Telegram issues
             base_delay = 30  # Start with 30s for Telegram internal issues
+            attempt = 0
             
-            for attempt in range(1, max_retries + 1):
+            while True:
+                attempt += 1
                 try:
-                    logging.info("Starting main bot (attempt %s/%s)", attempt, max_retries)
+                    logging.info("Starting main bot (attempt %s)", attempt)
                     
                     await initialize_clients()
                     
@@ -177,20 +186,16 @@ async def start_services():
                     return
                     
                 except Exception as e:
-                    logging.warning("Main bot startup failed (attempt %s/%s): %s", attempt, max_retries, e)
+                    logging.warning("Main bot startup failed (attempt %s): %s", attempt, e)
                     
                     try:
                         await StreamBot.disconnect()
                     except Exception:
                         pass
                     
-                    if attempt == max_retries:
-                        logging.error("All bot initialization attempts failed")
-                        return
-                    
-                    # Exponential backoff: 30s, 60s, 120s, 120s, 120s
+                    # Exponential backoff: 30s, 60s, 120s, 120s, 120s... (capped at 120s)
                     delay = min(base_delay * (2 ** (attempt - 1)), 120)
-                    logging.info("Waiting %ss before retry...", delay)
+                    logging.info("Waiting %ss before retry (attempt %s)...", delay, attempt + 1)
                     await asyncio.sleep(delay)
 
         # Start bot initialization in background
