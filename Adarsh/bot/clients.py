@@ -12,83 +12,98 @@ from . import multi_clients, work_loads, StreamBot
 
 async def initialize_clients():
 
-    # Register the main bot
     multi_clients.clear()
     work_loads.clear()
 
+    # Register main bot
     multi_clients[0] = StreamBot
     work_loads[0] = 0
 
     all_tokens = TokenParser().parse_from_env()
 
     if not all_tokens:
+        Var.MULTI_CLIENT = False
         print("No additional clients found, using default client")
         return
 
-    async def start_client(client_id, token):
+    started = 0
+
+    # Start clients sequentially
+    for client_id, token in all_tokens.items():
 
         client = None
 
-        try:
-            print(f"Starting - Client {client_id}")
+        for attempt in range(1, 6):
 
-            if client_id == len(all_tokens):
-                await asyncio.sleep(2)
-                print("This will take some time, please wait...")
+            try:
+                print(
+                    f"Starting Client {client_id} "
+                    f"(attempt {attempt}/5)"
+                )
 
-            client = Client(
-                name=str(client_id),
-                api_id=Var.API_ID,
-                api_hash=Var.API_HASH,
-                bot_token=token,
-                sleep_threshold=Var.SLEEP_THRESHOLD,
-                no_updates=True,
-                in_memory=True
-            )
+                client = Client(
+                    name=f"multi_{client_id}",
+                    api_id=Var.API_ID,
+                    api_hash=Var.API_HASH,
+                    bot_token=token,
+                    sleep_threshold=Var.SLEEP_THRESHOLD,
+                    no_updates=True,
+                    in_memory=True
+                )
 
-            await client.start()
+                await client.start()
 
-            print(f"Client {client_id} started successfully")
+                multi_clients[client_id] = client
+                work_loads[client_id] = 0
 
-            return client_id, client
+                started += 1
 
-        except Exception:
-            logging.exception(
-                f"Failed starting Client - {client_id}"
-            )
+                print(
+                    f"Client {client_id} started successfully"
+                )
 
-            if client:
-                try:
-                    await client.stop()
-                except Exception:
-                    pass
+                client = None
+                break
 
-            return None
+            except Exception as e:
 
-    results = await asyncio.gather(
-        *[
-            start_client(i, token)
-            for i, token in all_tokens.items()
-        ],
-        return_exceptions=True
-    )
+                logging.warning(
+                    "Client %s startup failed "
+                    "(attempt %s/5): %s",
+                    client_id,
+                    attempt,
+                    e
+                )
 
-    started = 0
+                if client is not None:
+                    try:
+                        await client.stop()
+                    except Exception:
+                        pass
 
-    for result in results:
+                    client = None
 
-        if isinstance(result, tuple):
-            client_id, client = result
+                if attempt < 5:
+                    delay = min(5 * (2 ** (attempt - 1)), 60)
 
-            multi_clients[client_id] = client
-            work_loads[client_id] = 0
+                    logging.info(
+                        "Retrying Client %s in %s seconds",
+                        client_id,
+                        delay
+                    )
 
-            started += 1
+                    await asyncio.sleep(delay)
+
+        # Give Telegram time between clients
+        await asyncio.sleep(3)
+
+    Var.MULTI_CLIENT = started > 0
 
     if started:
-        Var.MULTI_CLIENT = True
-        print(f"Multi-Client Mode Enabled: {started} additional clients")
+        print(
+            f"Multi-Client Mode Enabled: "
+            f"{started} additional clients"
+        )
     else:
-        Var.MULTI_CLIENT = False
-        print("No additional clients were initialized")
+        print("No additional clients initialized")
         print("Using default client")
