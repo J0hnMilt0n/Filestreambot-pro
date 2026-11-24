@@ -1,0 +1,45 @@
+# Koyeb deployment configuration
+# Deploy with: koyeb deploy --config koyeb.yaml
+
+name: filestreambot-pro
+version: 1.0.0
+
+services:
+  - name: web
+    type: web
+    instance_type: nano
+    regions:
+      - fra
+    ports:
+      - port: 8080
+        protocol: http
+    env:
+      - name: PORT
+        value: "8080"
+      - name: PYTHONUNBUFFERED
+        value: "1"
+    # Use buildpack (like Heroku)
+    build:
+      buildpack: heroku/python
+    run:
+      cmd: python -m Adarsh
+    # Health checks
+    healthchecks:
+      - name: liveness
+        path: /health
+        port: 8080
+        interval: 30
+        timeout: 10
+      - name: readiness
+        path: /ready
+        port: 8080
+        interval: 10
+        timeout: 5
+    # Scaling
+    scaling:
+      min_instances: 1
+      max_instances: 2
+
+# Required environment variables (set in Koyeb dashboard or via CLI)
+# API_ID, API_HASH, BOT_TOKEN, BIN_CHANNEL, DATABASE_URL, OWNER_ID
+# Optional: YOUTUBE_COOKIES_FILE=/app/youtube_cookies.txt
