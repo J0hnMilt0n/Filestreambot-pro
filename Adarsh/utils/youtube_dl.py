@@ -41,17 +41,30 @@ class YouTubeStreamer:
         
         # Priority 2: Cookie file from env var or default (only if not invalidated)
         if self.cookie_file and os.path.exists(self.cookie_file):
-            # Validate cookie file is readable and has content
+            # Validate cookie file is readable, has content, AND is parseable by MozillaCookieJar
             try:
                 with open(self.cookie_file, 'r') as f:
                     content = f.read().strip()
-                if content:
-                    logger.info("Using YouTube cookies from %s", self.cookie_file)
-                    return self.cookie_file
-                else:
+                if not content:
                     logger.warning("Cookie file %s is empty, ignoring", self.cookie_file)
+                    return None
+                
+                # Validate cookie format by trying to parse with MozillaCookieJar
+                import http.cookiejar
+                test_jar = http.cookiejar.MozillaCookieJar()
+                test_jar.load(self.cookie_file, ignore_discard=True, ignore_expires=True)
+                if len(test_jar) == 0:
+                    logger.warning("Cookie file %s has no valid cookies (parsing failed or all entries invalid), ignoring", self.cookie_file)
+                    return None
+                
+                logger.info("Using YouTube cookies from %s (%d cookies)", self.cookie_file, len(test_jar))
+                return self.cookie_file
+            except http.cookiejar.LoadError as e:
+                logger.warning("Cookie file %s format invalid (LoadError: %s), ignoring", self.cookie_file, e)
+                return None
             except Exception as e:
-                logger.warning("Cannot read cookie file %s: %s", self.cookie_file, e)
+                logger.warning("Cannot read/parse cookie file %s: %s", self.cookie_file, e)
+                return None
         
         return None
 
@@ -343,14 +356,14 @@ class YouTubeStreamer:
                     logger.warning("Video info failed (client: %s, cookies: %s): %s", player_client, use_cookies, stderr_str)
                     
                     # Detect invalid cookies - stop using them
-                    if "sign in to confirm" in stderr_str.lower() or "not a bot" in stderr_str.lower():
+                    if "sign in to confirm" in stderr_str.lower() or "not a bot" in stderr_str.lower() or "skipping cookie file entry due to invalid length" in stderr_str.lower():
                         cookies_invalid = True
                         # Clear cookie content so _prepare_cookies returns None for future attempts
                         self.cookie_content = None
                         # Also invalidate cookie file path so it won't be used again
                         self.cookie_file = None
                         self._cleanup_cookies()
-                        logger.warning("Cookies appear invalid, cleared cookies and will skip cookie attempts")
+                        logger.warning("Cookies appear invalid (bot detection or format error), cleared cookies and will skip cookie attempts")
                     
                     # If "no longer supported" or "video unavailable" error, try next client immediately
                     if "no longer supported" in stderr_str.lower() or "video is unavailable" in stderr_str.lower():
@@ -529,14 +542,14 @@ class YouTubeStreamer:
                         logger.warning("Format %s (client: %s, cookies: %s) failed: %s", fmt, player_client, use_cookies, stderr_str)
                         
                         # Detect invalid cookies - stop using them
-                        if "sign in to confirm" in stderr_str.lower() or "not a bot" in stderr_str.lower():
+                        if "sign in to confirm" in stderr_str.lower() or "not a bot" in stderr_str.lower() or "skipping cookie file entry due to invalid length" in stderr_str.lower():
                             cookies_invalid = True
                             # Clear cookie content so _prepare_cookies returns None for future attempts
                             self.cookie_content = None
                             # Also invalidate cookie file path so it won't be used again
                             self.cookie_file = None
                             self._cleanup_cookies()
-                            logger.warning("Cookies appear invalid, cleared cookies and will skip cookie attempts")
+                            logger.warning("Cookies appear invalid (bot detection or format error), cleared cookies and will skip cookie attempts")
                         
                         # If "no longer supported" or "video unavailable" error, try next client immediately
                         if "no longer supported" in stderr_str.lower() or "video is unavailable" in stderr_str.lower():
