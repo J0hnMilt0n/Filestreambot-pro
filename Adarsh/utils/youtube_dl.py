@@ -63,6 +63,9 @@ class YouTubeStreamer:
             "--extractor-retries", "3",
             "--socket-timeout", "30",
             "--extractor-args", "youtube:player_client=android_embedded",
+            # Age-gate bypass
+            "--age-limit", "99",
+            "--extractor-args", "youtube:skip=hls,dash",
             "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "--referer", "https://www.youtube.com/",
             "--add-header", "Accept-Language:en-US,en;q=0.9",
@@ -105,6 +108,8 @@ class YouTubeStreamer:
             "--extractor-retries", "3",
             "--socket-timeout", "30",
             # Use default player client for info (more compatible)
+            "--age-limit", "99",
+            "--extractor-args", "youtube:skip=hls,dash",
             "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "--referer", "https://www.youtube.com/",
             "--add-header", "Accept-Language:en-US,en;q=0.9",
@@ -118,37 +123,114 @@ class YouTubeStreamer:
         return cmd
 
     async def get_video_info(self, url: str) -> dict:
-        """Get video metadata without downloading."""
-        cmd = self._get_info_cmd() + [
-            "--dump-json",
-            "--no-download",
-            "--skip-download",
-            url
+        """Get video metadata without downloading. Tries multiple player clients."""
+        # Try multiple player clients in order of preference
+        player_clients = [
+            "android_embedded",
+            "tv_embedded", 
+            "web_embedded",
+            "web",
+            "default",  # No extractor args
         ]
         
+        last_error = None
+        
+        for player_client in player_clients:
+            cmd = self._get_info_cmd()
+            
+            # Set player client
+            if player_client == "default":
+                # Remove extractor-args
+                try:
+                    idx = cmd.index("--extractor-args")
+                    cmd.pop(idx)
+                    cmd.pop(idx)
+                except ValueError:
+                    pass
+            else:
+                # Replace or add extractor-args
+                try:
+                    idx = cmd.index("--extractor-args")
+                    cmd[idx+1] = f"youtube:player_client={player_client}"
+                except ValueError:
+                    cmd.extend(["--extractor-args", f"youtube:player_client={player_client}"])
+            
+            cmd.extend(["--dump-json", "--no-download", "--skip-download", url])
+            
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                stdout, stderr = await proc.communicate()
+                
+                if proc.returncode == 0:
+                    import json
+                    info = json.loads(stdout.decode())
+                    logger.info("Got video info with player_client: %s", player_client)
+                    self._cleanup_cookies()
+                    return info
+                
+                last_error = stderr.decode()
+                logger.warning("Video info failed (client: %s): %s", player_client, last_error[:200])
+                
+            except Exception as e:
+                last_error = str(e)
+                logger.warning("Video info exception (client: %s): %s", player_client, e)
+        
+        # Last resort: try without any special args
+        logger.info("All player clients failed for video info, trying basic command...")
         try:
+            basic_cmd = [
+                self.yt_dlp_path,
+                "--no-check-certificates",
+                "--no-warnings",
+                "--ignore-errors",
+                "--dump-json",
+                "--no-download",
+                "--skip-download",
+                url
+            ]
+            cookie_path = self._prepare_cookies()
+            if cookie_path:
+                basic_cmd.extend(["--cookies", cookie_path])
+            
             proc = await asyncio.create_subprocess_exec(
-                *cmd,
+                *basic_cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE
             )
             stdout, stderr = await proc.communicate()
             
-            if proc.returncode != 0:
-                logger.error("yt-dlp info failed: %s", stderr.decode())
-                # Don't raise - return minimal info so streaming can still attempt
-                return {"id": url.split("v=")[-1].split("&")[0], "title": "YouTube Video"}
+            if proc.returncode == 0:
+                import json
+                info = json.loads(stdout.decode())
+                logger.info("Got video info with basic command")
+                self._cleanup_cookies()
+                return info
             
-            import json
-            return json.loads(stdout.decode())
+            last_error = stderr.decode()
         except Exception as e:
-            logger.warning("Error getting video info, using fallback: %s", e)
-            # Return minimal info so streaming can still attempt
-            return {"id": url.split("v=")[-1].split("&")[0], "title": "YouTube Video"}
+            last_error = str(e)
+        
+        self._cleanup_cookies()
+        logger.error("All video info attempts failed: %s", last_error)
+        # Return minimal info so streaming can still attempt
+        return {"id": url.split("v=")[-1].split("&")[0], "title": "YouTube Video"}
 
     async def get_stream_url(self, url: str, quality: str = "best[ext=mp4]/best") -> str:
         """Get direct stream URL for a YouTube video with fallback formats."""
-        # Try multiple format selectors in order of preference
+        # Try multiple player clients in order of preference
+        player_clients = [
+            "android_embedded",
+            "tv_embedded", 
+            "web_embedded",
+            "web",
+            "default",  # No extractor args
+        ]
+        
+        # Format selectors to try
         formats = [
             quality,
             "best[ext=mp4]/best",
@@ -157,32 +239,28 @@ class YouTubeStreamer:
             "best",
         ]
         
-        # Try with android_embedded first, then without extractor args
-        extractor_args_options = [
-            ["--extractor-args", "youtube:player_client=android_embedded"],
-            [],  # No extractor args (default)
-        ]
-        
         last_error = None
-        for extractor_args in extractor_args_options:
+        
+        for player_client in player_clients:
             for fmt in formats:
                 cmd = self._get_base_cmd()
-                # Replace extractor args if provided
-                if extractor_args:
-                    # Find and replace the extractor-args in cmd
+                
+                # Set player client
+                if player_client == "default":
+                    # Remove extractor-args
                     try:
                         idx = cmd.index("--extractor-args")
-                        cmd[idx:idx+2] = extractor_args
-                    except ValueError:
-                        cmd.extend(extractor_args)
-                else:
-                    # Remove extractor-args if present
-                    try:
-                        idx = cmd.index("--extractor-args")
-                        cmd.pop(idx)  # --extractor-args
-                        cmd.pop(idx)  # value
+                        cmd.pop(idx)
+                        cmd.pop(idx)
                     except ValueError:
                         pass
+                else:
+                    # Replace or add extractor-args
+                    try:
+                        idx = cmd.index("--extractor-args")
+                        cmd[idx+1] = f"youtube:player_client={player_client}"
+                    except ValueError:
+                        cmd.extend(["--extractor-args", f"youtube:player_client={player_client}"])
                 
                 cmd.extend(["-g", "-f", fmt, url])
                 
@@ -197,16 +275,30 @@ class YouTubeStreamer:
                     if proc.returncode == 0:
                         urls = stdout.decode().strip().split('\n')
                         if urls and urls[0]:
-                            logger.info("Got stream URL with format: %s (extractor_args: %s)", fmt, extractor_args or "default")
+                            logger.info("Got stream URL with format: %s (player_client: %s)", fmt, player_client)
                             self._cleanup_cookies()
                             return urls[0]
                     
                     last_error = stderr.decode()
-                    logger.warning("Format %s failed: %s", fmt, last_error[:200])
+                    logger.warning("Format %s (client: %s) failed: %s", fmt, player_client, last_error[:200])
                     
                 except Exception as e:
                     last_error = str(e)
-                    logger.warning("Format %s exception: %s", fmt, e)
+                    logger.warning("Format %s (client: %s) exception: %s", fmt, player_client, e)
+        
+        # Last resort: try to list formats and pick any available
+        logger.info("All format attempts failed, trying to list available formats...")
+        try:
+            list_cmd = self._get_base_cmd() + ["--list-formats", url]
+            proc = await asyncio.create_subprocess_exec(
+                *list_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await proc.communicate()
+            logger.info("Available formats for %s:\n%s", url, stdout.decode()[:2000])
+        except Exception as e:
+            logger.warning("Failed to list formats: %s", e)
         
         self._cleanup_cookies()
         raise Exception(f"All format attempts failed. Last error: {last_error}")
@@ -261,7 +353,25 @@ class YouTubeStreamer:
                 cookie_jar=cookie_jar
             ) as session:
                 async with session.get(stream_url, headers=headers) as resp:
-                    if resp.status not in (200, 206):
+                    if resp.status == 403:
+                        # Try to get a fresh URL (URLs expire)
+                        logger.warning("Got 403, stream URL may have expired, retrying...")
+                        self._cleanup_cookies()
+                        # Recursive retry once with fresh URL
+                        stream_url = await self.get_stream_url(url, quality)
+                        if not stream_url:
+                            raise Exception("No stream URL found on retry")
+                        logger.info("Retrying with fresh URL: %s...", stream_url[:50])
+                        async with session.get(stream_url, headers=headers) as resp2:
+                            if resp2.status not in (200, 206):
+                                logger.error("Retry failed: %s", resp2.status)
+                                raise Exception(f"Stream request failed: {resp2.status}")
+                            async for chunk in resp2.content.iter_chunked(chunk_size):
+                                if not chunk:
+                                    continue
+                                yield chunk
+                            return
+                    elif resp.status not in (200, 206):
                         # Log response headers for debugging
                         logger.error("Stream request failed: %s, headers: %s", resp.status, dict(resp.headers))
                         raise Exception(f"Stream request failed: {resp.status}")
