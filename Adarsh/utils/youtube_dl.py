@@ -37,6 +37,9 @@ class YouTubeStreamer:
         ]
         
         # Add cookies if file exists
+        # Note: On Windows, Chrome cookies are encrypted with DPAPI and can't be read by yt-dlp directly.
+        # Use Firefox instead: yt-dlp --cookies-from-browser firefox -o /dev/null "URL"
+        # Or export cookies manually via browser extension "Get cookies.txt LOCALLY"
         if os.path.exists(self.cookie_file):
             cmd.extend(["--cookies", self.cookie_file])
             logger.info("Using YouTube cookies from %s", self.cookie_file)

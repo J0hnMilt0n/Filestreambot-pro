@@ -144,9 +144,9 @@ async def media_streamer(request):
                 status=503
             )
 
-        # Wait for at least one client to be connected (max 30s)
-        max_wait = 30
-        wait_interval = 1
+        # Wait for at least one client to be connected (max 10s, faster polling)
+        max_wait = 10
+        wait_interval = 0.5
         waited = 0
         connected = False
         
