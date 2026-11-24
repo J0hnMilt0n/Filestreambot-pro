@@ -450,12 +450,24 @@ async def stream_youtube_video(request, youtube_url: str, video_id: str):
         bytes_sent = 0
         
         try:
-            async for chunk in yt_streamer.stream_video(
+            # Add timeout to prevent infinite loading
+            stream_gen = yt_streamer.stream_video(
                 youtube_url,
                 start=start,
                 end=end,
                 chunk_size=chunk_size
-            ):
+            )
+            
+            # Use asyncio.wait_for with a reasonable timeout for each chunk
+            while True:
+                try:
+                    chunk = await asyncio.wait_for(stream_gen.__anext__(), timeout=30.0)
+                except StopAsyncIteration:
+                    break
+                except asyncio.TimeoutError:
+                    logger.warning("YouTube stream timeout for %s, closing", video_id)
+                    break
+                
                 if not chunk:
                     continue
                 
