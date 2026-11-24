@@ -95,9 +95,31 @@ class YouTubeStreamer:
         logger.info("ffmpeg available: %s", self._has_ffmpeg)
         return self._has_ffmpeg
 
+    def _get_info_cmd(self):
+        """Base command for getting video info (no format restrictions)."""
+        cmd = [
+            self.yt_dlp_path,
+            "--no-check-certificates",
+            "--no-warnings",
+            "--ignore-errors",
+            "--extractor-retries", "3",
+            "--socket-timeout", "30",
+            # Use default player client for info (more compatible)
+            "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "--referer", "https://www.youtube.com/",
+            "--add-header", "Accept-Language:en-US,en;q=0.9",
+        ]
+        
+        # Add cookies from env var or file
+        cookie_path = self._prepare_cookies()
+        if cookie_path:
+            cmd.extend(["--cookies", cookie_path])
+        
+        return cmd
+
     async def get_video_info(self, url: str) -> dict:
         """Get video metadata without downloading."""
-        cmd = self._get_base_cmd() + [
+        cmd = self._get_info_cmd() + [
             "--dump-json",
             "--no-download",
             "--skip-download",
@@ -114,13 +136,15 @@ class YouTubeStreamer:
             
             if proc.returncode != 0:
                 logger.error("yt-dlp info failed: %s", stderr.decode())
-                raise Exception(f"Failed to get video info: {stderr.decode()}")
+                # Don't raise - return minimal info so streaming can still attempt
+                return {"id": url.split("v=")[-1].split("&")[0], "title": "YouTube Video"}
             
             import json
             return json.loads(stdout.decode())
         except Exception as e:
-            logger.exception("Error getting video info")
-            raise
+            logger.warning("Error getting video info, using fallback: %s", e)
+            # Return minimal info so streaming can still attempt
+            return {"id": url.split("v=")[-1].split("&")[0], "title": "YouTube Video"}
 
     async def get_stream_url(self, url: str, quality: str = "best[ext=mp4]/best") -> str:
         """Get direct stream URL for a YouTube video with fallback formats."""
@@ -133,35 +157,56 @@ class YouTubeStreamer:
             "best",
         ]
         
+        # Try with android_embedded first, then without extractor args
+        extractor_args_options = [
+            ["--extractor-args", "youtube:player_client=android_embedded"],
+            [],  # No extractor args (default)
+        ]
+        
         last_error = None
-        for fmt in formats:
-            cmd = self._get_base_cmd() + [
-                "-g",
-                "-f", fmt,
-                url
-            ]
-            
-            try:
-                proc = await asyncio.create_subprocess_exec(
-                    *cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
-                )
-                stdout, stderr = await proc.communicate()
+        for extractor_args in extractor_args_options:
+            for fmt in formats:
+                cmd = self._get_base_cmd()
+                # Replace extractor args if provided
+                if extractor_args:
+                    # Find and replace the extractor-args in cmd
+                    try:
+                        idx = cmd.index("--extractor-args")
+                        cmd[idx:idx+2] = extractor_args
+                    except ValueError:
+                        cmd.extend(extractor_args)
+                else:
+                    # Remove extractor-args if present
+                    try:
+                        idx = cmd.index("--extractor-args")
+                        cmd.pop(idx)  # --extractor-args
+                        cmd.pop(idx)  # value
+                    except ValueError:
+                        pass
                 
-                if proc.returncode == 0:
-                    urls = stdout.decode().strip().split('\n')
-                    if urls and urls[0]:
-                        logger.info("Got stream URL with format: %s", fmt)
-                        self._cleanup_cookies()
-                        return urls[0]
+                cmd.extend(["-g", "-f", fmt, url])
                 
-                last_error = stderr.decode()
-                logger.warning("Format %s failed: %s", fmt, last_error[:200])
-                
-            except Exception as e:
-                last_error = str(e)
-                logger.warning("Format %s exception: %s", fmt, e)
+                try:
+                    proc = await asyncio.create_subprocess_exec(
+                        *cmd,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE
+                    )
+                    stdout, stderr = await proc.communicate()
+                    
+                    if proc.returncode == 0:
+                        urls = stdout.decode().strip().split('\n')
+                        if urls and urls[0]:
+                            logger.info("Got stream URL with format: %s (extractor_args: %s)", fmt, extractor_args or "default")
+                            self._cleanup_cookies()
+                            return urls[0]
+                    
+                    last_error = stderr.decode()
+                    logger.warning("Format %s failed: %s", fmt, last_error[:200])
+                    
+                except Exception as e:
+                    last_error = str(e)
+                    logger.warning("Format %s exception: %s", fmt, e)
         
         self._cleanup_cookies()
         raise Exception(f"All format attempts failed. Last error: {last_error}")

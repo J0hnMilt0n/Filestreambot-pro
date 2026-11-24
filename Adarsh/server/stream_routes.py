@@ -394,6 +394,12 @@ async def stream_youtube_video(request, youtube_url: str, video_id: str):
         except Exception:
             pass
         
+        # If no file_size, we can't support range requests - return 200 with no Content-Length
+        # This allows video playback but no seeking
+        if file_size is None and range_header:
+            logger.warning("YouTube video %s: file size unknown, ignoring Range header", video_id)
+            range_header = None
+        
         start = 0
         end = file_size - 1 if file_size else None
         
@@ -415,7 +421,7 @@ async def stream_youtube_video(request, youtube_url: str, video_id: str):
         
         headers = {
             "Content-Type": mime_type,
-            "Accept-Ranges": "bytes",
+            "Accept-Ranges": "bytes" if file_size else "none",
             "Content-Disposition": f'inline; filename="{quote(file_name)}"',
             "Cache-Control": "public, max-age=3600",
             "X-Content-Type-Options": "nosniff",
