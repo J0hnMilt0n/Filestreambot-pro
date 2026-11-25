@@ -112,7 +112,9 @@ async def media_streamer(request):
         /dl/{message_id}/{file_name}
 
     The message_id is the ID of the file in BIN_CHANNEL.
-    Optional query param: ?id=youtube_id_or_url (used as fallback if Telegram file not found)
+    Optional query params:
+        ?id=youtube_id_or_url (used as fallback if Telegram file not found)
+        ?start=seconds (custom start time for video playback)
     """
 
     try:
@@ -123,6 +125,17 @@ async def media_streamer(request):
 
         # Check for YouTube ID in query parameter (fallback)
         youtube_id_param = request.query.get("id")
+        
+        # Support custom start time via ?start=seconds query parameter
+        start_seconds = request.query.get("start")
+        start_bytes = 0
+        if start_seconds:
+            try:
+                start_seconds = float(start_seconds)
+                # We'll convert to bytes after getting file_size
+                # For now, store the seconds value
+            except ValueError:
+                start_seconds = None
         
         if not raw_file_id:
             return web.Response(
@@ -138,7 +151,7 @@ async def media_streamer(request):
             if is_youtube_url(raw_file_id):
                 youtube_id = extract_youtube_id(raw_file_id)
                 youtube_url = f"https://www.youtube.com/watch?v={youtube_id}"
-                return await stream_youtube_video(request, youtube_url, youtube_id)
+                return await stream_youtube_video(request, youtube_url, youtube_id, start_seconds=start_seconds)
             return web.Response(
                 text="Invalid file ID",
                 status=400
@@ -171,7 +184,7 @@ async def media_streamer(request):
             if youtube_id_param and is_youtube_url(youtube_id_param):
                 youtube_id = extract_youtube_id(youtube_id_param)
                 youtube_url = f"https://www.youtube.com/watch?v={youtube_id}"
-                return await stream_youtube_video(request, youtube_url, youtube_id)
+                return await stream_youtube_video(request, youtube_url, youtube_id, start_seconds=start_seconds)
             return web.Response(
                 text="Telegram clients not ready, please retry in a moment",
                 status=503,
@@ -202,7 +215,7 @@ async def media_streamer(request):
                 logger.info("Falling back to YouTube due to expired session: %s", youtube_id_param)
                 youtube_id = extract_youtube_id(youtube_id_param)
                 youtube_url = f"https://www.youtube.com/watch?v={youtube_id}"
-                return await stream_youtube_video(request, youtube_url, youtube_id)
+                return await stream_youtube_video(request, youtube_url, youtube_id, start_seconds=start_seconds)
             return web.Response(
                 text="Telegram session expired, please retry later",
                 status=503,
@@ -214,7 +227,7 @@ async def media_streamer(request):
                 logger.info("Telegram file %s not found, falling back to YouTube: %s", file_id, youtube_id_param)
                 youtube_id = extract_youtube_id(youtube_id_param)
                 youtube_url = f"https://www.youtube.com/watch?v={youtube_id}"
-                return await stream_youtube_video(request, youtube_url, youtube_id)
+                return await stream_youtube_video(request, youtube_url, youtube_id, start_seconds=start_seconds)
             raise  # Re-raise if no YouTube fallback
 
         file_size = int(file_properties.file_size)
@@ -238,20 +251,32 @@ async def media_streamer(request):
 
         # Determine the requested byte range.
         range_header = request.headers.get("Range")
-
-        try:
-            start, end = parse_range_header(
-                range_header,
-                file_size
-            )
-        except (ValueError, TypeError):
-            return web.Response(
-                status=416,
-                headers={
-                    "Content-Range": f"bytes */{file_size}",
-                    "Accept-Ranges": "bytes"
-                }
-            )
+        
+        # If no Range header but start_seconds provided, calculate byte position
+        # Note: This is approximate since we don't know exact bitrate
+        # For better seeking, the video player should send Range headers
+        if not range_header and start_seconds is not None:
+            # Estimate bytes from seconds (rough approximation: assume ~1MB/s for 720p)
+            # This is a fallback; proper seeking requires Range header from player
+            estimated_bitrate = 1_000_000  # ~8 Mbps
+            start = int(start_seconds * estimated_bitrate)
+            start = min(max(start, 0), file_size - 1)
+            end = file_size - 1
+            logger.info("Using start_seconds=%.1f, estimated start byte=%d", start_seconds, start)
+        else:
+            try:
+                start, end = parse_range_header(
+                    range_header,
+                    file_size
+                )
+            except (ValueError, TypeError):
+                return web.Response(
+                    status=416,
+                    headers={
+                        "Content-Range": f"bytes */{file_size}",
+                        "Accept-Ranges": "bytes"
+                    }
+                )
 
         content_length = end - start + 1
 
@@ -373,7 +398,7 @@ async def media_streamer(request):
         )
 
 
-async def stream_youtube_video(request, youtube_url: str, video_id: str):
+async def stream_youtube_video(request, youtube_url: str, video_id: str, start_seconds: float = None):
     """Stream a YouTube video using yt-dlp.
 
     IMPORTANT: Response headers are sent IMMEDIATELY (before the slow yt-dlp
@@ -387,7 +412,7 @@ async def stream_youtube_video(request, youtube_url: str, video_id: str):
         # This prevents Koyeb LB 502 timeouts during slow URL extraction.
         headers = {
             "Content-Type": "video/mp4",
-            "Accept-Ranges": "none",
+            "Accept-Ranges": "bytes",
             "Content-Disposition": f'inline; filename="youtube_{video_id}.mp4"',
             "Cache-Control": "public, max-age=3600",
             "X-Content-Type-Options": "nosniff",
@@ -404,9 +429,15 @@ async def stream_youtube_video(request, youtube_url: str, video_id: str):
         # Now do the slow extraction (Invidious + yt-dlp fallbacks).
         # This can take minutes - but headers are already sent, so no 502.
         try:
+            # Convert start_seconds to start bytes (approximate)
+            start_bytes = 0
+            if start_seconds is not None:
+                estimated_bitrate = 1_000_000  # ~8 Mbps
+                start_bytes = int(start_seconds * estimated_bitrate)
+            
             stream_gen = yt_streamer.stream_video(
                 youtube_url,
-                start=0,
+                start=start_bytes,
                 end=None,
                 chunk_size=512 * 1024
             )

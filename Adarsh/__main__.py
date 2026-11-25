@@ -99,6 +99,47 @@ async def load_plugins():
     print("------------------------------ DONE ------------------------------")
 
 
+async def monitor_bot_sessions():
+    """Background task to monitor bot sessions and auto-reconnect on expiry."""
+    from .bot import multi_clients, work_loads
+    from .bot.clients import initialize_clients, is_auth_key_error
+    import sys
+    
+    while True:
+        await asyncio.sleep(60)  # Check every minute
+        
+        try:
+            # Check all Telethon clients
+            for idx, client in list(multi_clients.items()):
+                if not isinstance(idx, int):  # Skip Pyrogram client
+                    continue
+                
+                if not client.is_connected():
+                    logger.warning("Client %s disconnected, attempting reconnection...", idx)
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
+                    
+                    # Remove from work_loads
+                    work_loads.pop(idx, None)
+                    
+                    # Re-initialize all clients
+                    logger.info("Re-initializing all Telegram clients...")
+                    await initialize_clients()
+                    
+                    # Verify bot is working
+                    from .bot import StreamBot as UpdatedStreamBot
+                    bot_info = await UpdatedStreamBot.get_me()
+                    UpdatedStreamBot.username = bot_info.username
+                    logger.info("Bot reconnected successfully: @%s", bot_info.username)
+                    break  # Only need to reinitialize once
+                    
+        except Exception as e:
+            logger.warning("Session monitor error: %s", e)
+            await asyncio.sleep(30)
+
+
 async def start_services():
 
     app_runner = None
@@ -199,6 +240,9 @@ async def start_services():
                     print(f"Bot        =>> {bot_info.first_name}")
                     print(f"Owner      =>> {Var.OWNER_USERNAME}")
                     print("------------------------------------------------------------------")
+                    
+                    # Start background session monitor to auto-reconnect on session expiry
+                    asyncio.create_task(monitor_bot_sessions())
                     return
                     
                 except Exception as e:
