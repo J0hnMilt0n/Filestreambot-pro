@@ -20,6 +20,10 @@ logger = logging.getLogger(__name__)
 
 CHUNK_SIZE = 512 * 1024
 
+# Track application start time for uptime
+import time
+APP_START_TIME = time.time()
+
 # One streamer instance per Telegram client.
 streamers = {}
 
@@ -454,10 +458,38 @@ async def stream_youtube_video(request, youtube_url: str, video_id: str):
 
 async def health_check(request):
     """Health check endpoint for container orchestration."""
+    uptime_seconds = int(time.time() - APP_START_TIME)
+    hours, remainder = divmod(uptime_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    uptime_str = f"{hours}h {minutes}m {seconds}s"
+    
     return web.json_response({
         "status": "healthy",
         "service": "filestreambot-pro",
-        "clients_connected": len(multi_clients)
+        "clients_connected": len(multi_clients),
+        "uptime": uptime_str,
+        "uptime_seconds": uptime_seconds
+    })
+
+
+async def root_handler(request):
+    """Root endpoint with basic info and uptime."""
+    uptime_seconds = int(time.time() - APP_START_TIME)
+    hours, remainder = divmod(uptime_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    uptime_str = f"{hours}h {minutes}m {seconds}s"
+    
+    return web.json_response({
+        "service": "filestreambot-pro",
+        "status": "running",
+        "uptime": uptime_str,
+        "endpoints": {
+            "health": "/health",
+            "ready": "/ready",
+            "stream": "/watch/{message_id}/{filename}",
+            "download": "/dl/{message_id}/{filename}",
+            "youtube_fallback": "?id=youtube_id_or_url"
+        }
     })
 
 
@@ -489,6 +521,7 @@ async def options_handler(request):
 
 
 routes = [
+    web.get("/", root_handler),
     web.get("/health", health_check),
     web.get("/ready", readiness_check),
     web.get("/watch/{id}/{file_name}", media_streamer),

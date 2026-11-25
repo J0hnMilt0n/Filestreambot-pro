@@ -186,24 +186,35 @@ class YouTubeStreamer:
         if hasattr(self, '_deno_checked') and self._deno_checked:
             return getattr(self, '_has_deno', False)
         
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "deno", "--version",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            stdout, _ = await proc.communicate()
-            self._has_deno = proc.returncode == 0
-            if self._has_deno:
-                logger.info("Deno available: %s", stdout.decode().strip().split('\n')[0])
-            else:
-                logger.warning("Deno not available - SABR formats (tv_embedded, android_embedded) may fail")
-        except Exception as e:
-            self._has_deno = False
-            logger.warning("Deno check failed: %s - SABR formats may fail", e)
+        # Check multiple possible Deno locations (Docker installs to /root/.deno/bin)
+        deno_paths = [
+            "deno",  # In PATH
+            "/root/.deno/bin/deno",  # Docker default
+            "/usr/local/bin/deno",
+            "/usr/bin/deno",
+            "/opt/deno/deno",
+        ]
         
+        for deno_path in deno_paths:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    deno_path, "--version",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                stdout, _ = await proc.communicate()
+                if proc.returncode == 0:
+                    self._has_deno = True
+                    logger.info("Deno available at %s: %s", deno_path, stdout.decode().strip().split('\n')[0])
+                    self._deno_checked = True
+                    return True
+            except Exception:
+                continue
+        
+        self._has_deno = False
+        logger.warning("Deno not found in any standard location - SABR formats (tv_embedded, android_embedded) may fail")
         self._deno_checked = True
-        return self._has_deno
+        return False
 
     def _extract_video_id(self, url: str) -> str:
         """Extract video ID from YouTube URL."""
