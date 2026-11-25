@@ -6,7 +6,7 @@ import re
 from urllib.parse import quote, unquote
 
 from aiohttp import web
-from aiohttp.client_exceptions import ClientConnectionResetError
+from aiohttp.client_exceptions import ClientConnectionError
 from telethon.errors import AuthKeyUnregisteredError
 
 from Adarsh.bot import multi_clients, work_loads
@@ -323,7 +323,7 @@ async def media_streamer(request):
                     content_length
                 )
 
-        except (ConnectionResetError, asyncio.CancelledError, ClientConnectionResetError):
+        except (ConnectionResetError, asyncio.CancelledError, ClientConnectionError):
             logger.info(
                 "Client disconnected while streaming file %s",
                 file_id
