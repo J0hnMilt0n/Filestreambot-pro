@@ -153,7 +153,20 @@ async def media_streamer(request):
         # Filter out non-Telethon clients (like "pyro" Pyrogram client) for streaming
         telethon_clients = {k: v for k, v in multi_clients.items() if isinstance(k, int)}
         
-        if not telethon_clients:
+        # Debug logging
+        logger.info("multi_clients keys: %s, telethon_clients: %s", list(multi_clients.keys()), list(telethon_clients.keys()))
+        for idx, client in telethon_clients.items():
+            logger.info("Client %s: connected=%s", idx, client.is_connected())
+        
+        # Clean up disconnected clients from work_loads to prevent stale entries
+        connected_clients = {k: v for k, v in telethon_clients.items() if v.is_connected()}
+        if len(connected_clients) != len(telethon_clients):
+            disconnected = set(telethon_clients.keys()) - set(connected_clients.keys())
+            logger.warning("Removing disconnected clients from work_loads: %s", disconnected)
+            for idx in disconnected:
+                work_loads.pop(idx, None)
+        
+        if not connected_clients:
             logger.warning("No Telethon clients available for streaming")
             if youtube_id_param and is_youtube_url(youtube_id_param):
                 youtube_id = extract_youtube_id(youtube_id_param)
@@ -165,29 +178,11 @@ async def media_streamer(request):
                 headers={"Retry-After": "30"}
             )
 
-        # Select the client with the lowest current workload (only Telethon clients)
+        # Select the client with the lowest current workload (only connected Telethon clients)
         index = min(
-            telethon_clients.keys(),
+            connected_clients.keys(),
             key=lambda client_index: work_loads.get(client_index, 0)
         )
-
-        # Check if selected client is connected, find any connected Telethon client
-        if not telethon_clients[index].is_connected():
-            for idx, client in telethon_clients.items():
-                if client.is_connected():
-                    index = idx
-                    break
-            else:
-                logger.warning("No Telethon clients connected, trying YouTube fallback")
-                if youtube_id_param and is_youtube_url(youtube_id_param):
-                    youtube_id = extract_youtube_id(youtube_id_param)
-                    youtube_url = f"https://www.youtube.com/watch?v={youtube_id}"
-                    return await stream_youtube_video(request, youtube_url, youtube_id)
-                return web.Response(
-                    text="Telegram bot not connected, please retry in a moment",
-                    status=503,
-                    headers={"Retry-After": "30"}
-                )
 
         streamer = get_streamer(index)
 

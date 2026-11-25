@@ -133,57 +133,69 @@ async def initialize_clients():
     from Adarsh.bot import StreamBot as BotInstance
     
     # Try with proxy first, then direct connection
+    bot_started = False
     for use_proxy in [True, False]:
         if not use_proxy:
             logging.warning("Proxy failed, falling back to DIRECT connection...")
         
-        # Recreate StreamBot with appropriate connection
-        StreamBot = create_client(MemorySession(), use_proxy=use_proxy)
-        multi_clients[0] = StreamBot
-        # Update module-level reference so all imports see the new client
-        sys.modules['Adarsh.bot'].StreamBot = StreamBot
-        
-        try:
-            logging.info("Starting main bot (proxy=%s)...", use_proxy)
-            await StreamBot.start(bot_token=Var.BOT_TOKEN)
-            logging.info("Main bot started successfully with %s", "proxy" if use_proxy else "direct connection")
-            break
-        except Exception as e:
-            logging.warning("Main bot startup failed (proxy=%s): %s", use_proxy, e)
-            
-            # Handle AuthKeyUnregisteredError - delete session and retry
-            if is_auth_key_error(e):
-                logging.warning("AuthKeyUnregisteredError detected, cleaning up session files...")
-                cleanup_session_files()
-                # Force reconnection by creating new client
-                try:
-                    await StreamBot.disconnect()
-                except Exception:
-                    pass
-                StreamBot = create_client(MemorySession(), use_proxy=use_proxy)
-                multi_clients[0] = StreamBot
-                continue  # Retry with same proxy setting
-            
-            # Handle FloodWaitError - wait for required time
-            wait_time = is_flood_wait_error(e)
-            if wait_time:
-                logging.warning("FloodWaitError: waiting %ss before retry...", wait_time)
-                try:
-                    await StreamBot.disconnect()
-                except Exception:
-                    pass
-                await asyncio.sleep(wait_time)
-                # Retry with same proxy setting
-                StreamBot = create_client(MemorySession(), use_proxy=use_proxy)
-                multi_clients[0] = StreamBot
-                continue
+        # Retry loop for each connection type (handles FloodWaitError, AuthKeyUnregisteredError)
+        max_retries_per_type = 3
+        for retry in range(max_retries_per_type):
+            # Recreate StreamBot with appropriate connection
+            StreamBot = create_client(MemorySession(), use_proxy=use_proxy)
+            multi_clients[0] = StreamBot
+            # Update module-level reference so all imports see the new client
+            sys.modules['Adarsh.bot'].StreamBot = StreamBot
             
             try:
-                await StreamBot.disconnect()
-            except Exception:
-                pass
-            if not use_proxy:
-                raise  # Both proxy and direct failed
+                logging.info("Starting main bot (proxy=%s, attempt %s/%s)...", use_proxy, retry + 1, max_retries_per_type)
+                await StreamBot.start(bot_token=Var.BOT_TOKEN)
+                logging.info("Main bot started successfully with %s", "proxy" if use_proxy else "direct connection")
+                bot_started = True
+                break
+            except Exception as e:
+                logging.warning("Main bot startup failed (proxy=%s, attempt %s/%s): %s", use_proxy, retry + 1, max_retries_per_type, e)
+                
+                # Handle AuthKeyUnregisteredError - delete session and retry
+                if is_auth_key_error(e):
+                    logging.warning("AuthKeyUnregisteredError detected, cleaning up session files...")
+                    cleanup_session_files()
+                    # Force reconnection by creating new client
+                    try:
+                        await StreamBot.disconnect()
+                    except Exception:
+                        pass
+                    # Retry same proxy setting (loop continues)
+                    continue
+                
+                # Handle FloodWaitError - wait for required time
+                wait_time = is_flood_wait_error(e)
+                if wait_time:
+                    logging.warning("FloodWaitError: waiting %ss before retry...", wait_time)
+                    try:
+                        await StreamBot.disconnect()
+                    except Exception:
+                        pass
+                    await asyncio.sleep(wait_time)
+                    # Retry same proxy setting (loop continues)
+                    continue
+                
+                try:
+                    await StreamBot.disconnect()
+                except Exception:
+                    pass
+                
+                # If last retry for this proxy type, break to try next proxy type
+                if retry == max_retries_per_type - 1:
+                    break
+                # Otherwise continue to next retry
+        
+        if bot_started:
+            break
+    
+    if not bot_started:
+        raise Exception("Failed to start main bot with both proxy and direct connection")
+    
     work_loads[0] = 0
 
     # Additional bot clients
@@ -199,52 +211,68 @@ async def initialize_clients():
     for client_id, token in all_tokens.items():
 
         client = None
+        client_started = False
 
         # Try with proxy first, then direct connection
         for use_proxy in [True, False]:
             if not use_proxy:
                 logging.warning("Client %s: Proxy failed, falling back to DIRECT connection...", client_id)
             
-            try:
-                logging.info("Starting client %s (proxy=%s)...", client_id, use_proxy)
-                client = create_client(MemorySession(), use_proxy=use_proxy)
-                await client.start(bot_token=token)
-                multi_clients[client_id] = client
-                work_loads[client_id] = 0
-                started += 1
-                logging.info("Client %s started successfully with %s", client_id, "proxy" if use_proxy else "direct connection")
-                client = None
-                break
-            except Exception as e:
-                logging.warning("Client %s failed (proxy=%s): %s", client_id, use_proxy, e)
-                
-                # Handle AuthKeyUnregisteredError for additional clients
-                if is_auth_key_error(e):
-                    logging.warning("Client %s: AuthKeyUnregisteredError detected, cleaning up session files...", client_id)
-                    cleanup_session_files()
-                
-                # Handle FloodWaitError for additional clients
-                wait_time = is_flood_wait_error(e)
-                if wait_time:
-                    logging.warning("Client %s: FloodWaitError: waiting %ss before retry...", client_id, wait_time)
+            # Retry loop for each connection type
+            max_retries_per_type = 3
+            for retry in range(max_retries_per_type):
+                try:
+                    logging.info("Starting client %s (proxy=%s, attempt %s/%s)...", client_id, use_proxy, retry + 1, max_retries_per_type)
+                    client = create_client(MemorySession(), use_proxy=use_proxy)
+                    await client.start(bot_token=token)
+                    multi_clients[client_id] = client
+                    work_loads[client_id] = 0
+                    started += 1
+                    logging.info("Client %s started successfully with %s", client_id, "proxy" if use_proxy else "direct connection")
+                    client = None
+                    client_started = True
+                    break
+                except Exception as e:
+                    logging.warning("Client %s failed (proxy=%s, attempt %s/%s): %s", client_id, use_proxy, retry + 1, max_retries_per_type, e)
+                    
+                    # Handle AuthKeyUnregisteredError for additional clients
+                    if is_auth_key_error(e):
+                        logging.warning("Client %s: AuthKeyUnregisteredError detected, cleaning up session files...", client_id)
+                        cleanup_session_files()
+                        # Retry same proxy setting
+                        if client is not None:
+                            try:
+                                await client.disconnect()
+                            except Exception:
+                                pass
+                        continue
+                    
+                    # Handle FloodWaitError for additional clients
+                    wait_time = is_flood_wait_error(e)
+                    if wait_time:
+                        logging.warning("Client %s: FloodWaitError: waiting %ss before retry...", client_id, wait_time)
+                        if client is not None:
+                            try:
+                                await client.disconnect()
+                            except Exception:
+                                pass
+                        await asyncio.sleep(wait_time)
+                        # Retry same proxy setting
+                        client = create_client(MemorySession(), use_proxy=use_proxy)
+                        continue
+                    
                     if client is not None:
                         try:
                             await client.disconnect()
                         except Exception:
                             pass
-                    await asyncio.sleep(wait_time)
-                    # Retry with same proxy setting
-                    client = create_client(MemorySession(), use_proxy=use_proxy)
-                    continue
-                
-                if client is not None:
-                    try:
-                        await client.disconnect()
-                    except Exception:
-                        pass
-                if not use_proxy:
-                    # Both proxy and direct failed
-                    pass
+                    
+                    # If last retry for this proxy type, break to try next proxy type
+                    if retry == max_retries_per_type - 1:
+                        break
+            
+            if client_started:
+                break
 
         await asyncio.sleep(3)
 
