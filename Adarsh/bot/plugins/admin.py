@@ -10,7 +10,7 @@ from Adarsh.utils.broadcast_helper import send_msg
 from Adarsh.utils.database import Database
 from Adarsh.bot import multi_clients
 from Adarsh.vars import Var
-from pyrogram import filters
+from pyrogram import filters, Client
 from pyrogram.types import Message
 db = Database(Var.DATABASE_URL, Var.name)
 Broadcast_IDs = {}

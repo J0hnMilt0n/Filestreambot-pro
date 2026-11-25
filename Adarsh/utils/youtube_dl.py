@@ -208,7 +208,11 @@ class YouTubeStreamer:
                     logger.info("Deno available at %s: %s", deno_path, stdout.decode().strip().split('\n')[0])
                     self._deno_checked = True
                     return True
-            except Exception:
+            except FileNotFoundError:
+                # Executable not found at this path, try next
+                continue
+            except Exception as e:
+                logger.debug("Deno check error at %s: %s", deno_path, e)
                 continue
         
         self._has_deno = False
@@ -666,13 +670,14 @@ class YouTubeStreamer:
         
         # Last resort: try without any explicit format (let yt-dlp pick best available)
         # This handles SABR-only videos when Deno is not available
-        logger.info("All explicit formats failed, trying without format specification (let yt-dlp auto-select)...")
-        for player_client in player_clients:
-            for use_cookies in [True, False]:
-                if not use_cookies:
-                    logger.info("Trying auto-format without cookies...")
-                
-                cmd, env = self._get_base_cmd()
+        logger.info(">>> AUTO-FORMAT FALLBACK: All explicit formats failed, trying without format specification (let yt-dlp auto-select)...")
+        try:
+            for player_client in player_clients:
+                for use_cookies in [True, False]:
+                    if not use_cookies:
+                        logger.info("Trying auto-format without cookies...")
+                    
+                    cmd, env = self._get_base_cmd()
                 
                 # Remove cookies if not using them OR if cookies are invalid
                 if not use_cookies or self._cookies_invalidated:
@@ -738,6 +743,9 @@ class YouTubeStreamer:
                     
                 except Exception as e:
                     logger.warning("Auto-format (client: %s, cookies: %s) exception: %s", player_client, use_cookies, e)
+        
+        except Exception as e:
+            logger.error("Auto-format fallback failed with exception: %s", e)
         
         self._cleanup_cookies()
         # Provide more context about the failure
