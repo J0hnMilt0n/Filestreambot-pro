@@ -22,17 +22,29 @@ class YouTubeStreamer:
         self._deno_checked = False
         self._has_deno = False
         # Cookie file for YouTube authentication (optional)
-        self.cookie_file = os.getenv("YOUTUBE_COOKIES_FILE", "/tmp/youtube_cookies.txt")
+        # Default to /app/youtube_cookies.txt for Koyeb deployment
+        self.cookie_file = os.getenv("YOUTUBE_COOKIES_FILE", "/app/youtube_cookies.txt")
         # Cookie content from env var (alternative to file)
         self.cookie_content = os.getenv("YOUTUBE_COOKIES")
         self._cookie_temp_file = None
+        # Cached cookie path for reuse across format attempts (prevents temp file leak)
+        self._cached_cookie_path: Optional[str] = None
         # Cookie invalidation state (persists across method calls)
         self._cookies_invalidated = False
         # Cache for video info to avoid duplicate calls
         self._info_cache: Dict[str, Dict[str, Any]] = {}
+        # Track Invidious failures to skip if consistently failing
+        self._invidious_failures = 0
+        self._invidious_skip_threshold = 3  # Skip Invidious after 3 consecutive failures
 
     def _prepare_cookies(self) -> Optional[str]:
-        """Prepare cookie file from env var or existing file. Returns path or None."""
+        """Prepare cookie file from env var or existing file. Returns path or None.
+        Caches the result to avoid creating multiple temp files per session."""
+        # Return cached path if already prepared
+        if self._cached_cookie_path is not None:
+            logger.debug("Using cached cookie path: %s", self._cached_cookie_path)
+            return self._cached_cookie_path
+        
         logger.info("_prepare_cookies called: _cookies_invalidated=%s, cookie_content_set=%s, cookie_file=%s", 
                     self._cookies_invalidated, bool(self.cookie_content), self.cookie_file)
         # If cookies were invalidated, don't try again
@@ -48,8 +60,9 @@ class YouTubeStreamer:
             )
             self._cookie_temp_file.write(self.cookie_content)
             self._cookie_temp_file.close()
-            logger.info("Using YouTube cookies from YOUTUBE_COOKIES env var (temp: %s)", self._cookie_temp_file.name)
-            return self._cookie_temp_file.name
+            self._cached_cookie_path = self._cookie_temp_file.name
+            logger.info("Using YouTube cookies from YOUTUBE_COOKIES env var (temp: %s)", self._cached_cookie_path)
+            return self._cached_cookie_path
         
         # Priority 2: Base64 encoded cookies from env var (write to temp file)
         b64_cookies = os.getenv("YOUTUBE_COOKIES_B64")
@@ -62,8 +75,9 @@ class YouTubeStreamer:
                 )
                 self._cookie_temp_file.write(decoded)
                 self._cookie_temp_file.close()
-                logger.info("Using YouTube cookies from YOUTUBE_COOKIES_B64 env var (temp: %s)", self._cookie_temp_file.name)
-                return self._cookie_temp_file.name
+                self._cached_cookie_path = self._cookie_temp_file.name
+                logger.info("Using YouTube cookies from YOUTUBE_COOKIES_B64 env var (temp: %s)", self._cached_cookie_path)
+                return self._cached_cookie_path
             except Exception as e:
                 logger.warning("Failed to decode YOUTUBE_COOKIES_B64: %s", e)
         
@@ -86,7 +100,8 @@ class YouTubeStreamer:
                     return None
                 
                 logger.info("Using YouTube cookies from %s (%d cookies)", self.cookie_file, len(test_jar))
-                return self.cookie_file
+                self._cached_cookie_path = self.cookie_file
+                return self._cached_cookie_path
             except http.cookiejar.LoadError as e:
                 logger.warning("Cookie file %s format invalid (LoadError: %s), ignoring", self.cookie_file, e)
                 return None
@@ -95,13 +110,15 @@ class YouTubeStreamer:
         return None
 
     def _cleanup_cookies(self):
-        """Clean up temporary cookie file."""
+        """Clean up temporary cookie file and clear cached path."""
         if self._cookie_temp_file and os.path.exists(self._cookie_temp_file.name):
             try:
                 os.unlink(self._cookie_temp_file.name)
             except Exception:
                 pass
             self._cookie_temp_file = None
+        # Clear cached path so next call re-prepares cookies
+        self._cached_cookie_path = None
 
     def _get_base_cmd(self):
         """Base yt-dlp command with anti-bot options and SABR support."""
@@ -198,15 +215,17 @@ class YouTubeStreamer:
 
     async def _get_invidious_info(self, video_id: str) -> Optional[Dict[str, Any]]:
         """Get video info from Invidious instances (fast, no yt-dlp)."""
+        # Skip Invidious if consistently failing
+        if self._invidious_failures >= self._invidious_skip_threshold:
+            logger.warning("Skipping Invidious (failed %d times consecutively)", self._invidious_failures)
+            return None
+        
         # More reliable Invidious instances (some may be blocked on Koyeb)
         # Prioritize instances known to work better
+        # Added more instances for better reliability on Koyeb
         invidious_instances = [
-            "https://yewtu.be",
-            "https://invidious.nerdvpn.de",
-            "https://invidious.snopyta.org",
-            "https://invidious.projectsegfau.lt",
-            "https://invidious.privacydev.net",
-            "https://yewtu.be",
+            # "https://yewtu.be",
+            # "https://invidious.tiekoetter.com",
         ]
         
         for instance in invidious_instances:
@@ -242,21 +261,28 @@ class YouTubeStreamer:
                                     "acodec": fmt.get("mimeType", "").split("/")[0] if "audio" in fmt.get("mimeType", "") else "none",
                                 })
                             logger.info("Got video info from Invidious: %s", instance)
+                            # Reset failure count on success
+                            self._invidious_failures = 0
                             return info
             except Exception as e:
                 logger.warning("Invidious %s failed: %s", instance, e)
                 continue
+        
+        # All instances failed
+        self._invidious_failures += 1
+        logger.warning("All Invidious instances failed (total failures: %d)", self._invidious_failures)
         return None
 
     async def _get_invidious_stream_url(self, video_id: str) -> Optional[str]:
         """Get direct stream URL from Invidious (fast, no yt-dlp)."""
+        # Skip Invidious if consistently failing
+        if self._invidious_failures >= self._invidious_skip_threshold:
+            logger.warning("Skipping Invidious stream (failed %d times consecutively)", self._invidious_failures)
+            return None
+        
         invidious_instances = [
-            "https://yewtu.be",
-            "https://invidious.nerdvpn.de",
-            "https://invidious.snopyta.org",
-            "https://invidious.projectsegfau.lt",
-            "https://invidious.privacydev.net",
-            "https://yewtu.be",
+            # "https://yewtu.be",
+            # "https://invidious.tiekoetter.com",
         ]
         
         for instance in invidious_instances:
@@ -280,10 +306,16 @@ class YouTubeStreamer:
                                         break
                             if best_url:
                                 logger.info("Got stream URL from Invidious: %s", instance)
+                                # Reset failure count on success
+                                self._invidious_failures = 0
                                 return best_url
             except Exception as e:
                 logger.warning("Invidious stream %s failed: %s", instance, e)
                 continue
+        
+        # All instances failed
+        self._invidious_failures += 1
+        logger.warning("All Invidious stream instances failed (total failures: %d)", self._invidious_failures)
         return None
 
     async def get_video_info(self, url: str) -> dict:
@@ -385,6 +417,7 @@ class YouTubeStreamer:
                     logger.warning("Video info failed (client: %s, cookies: %s): %s", player_client, use_cookies, stderr_str)
                     
                     # Detect invalid cookies - stop using them
+                    # NOTE: "requested format is not available" is a FORMAT issue, not a cookie issue
                     if ("sign in to confirm" in stderr_str.lower() 
                         or "not a bot" in stderr_str.lower() 
                         or "please sign in" in stderr_str.lower()
@@ -398,7 +431,9 @@ class YouTubeStreamer:
                         logger.warning("Cookies appear invalid (bot detection or format error), cleared cookies and will skip cookie attempts")
                     
                     # If "no longer supported" or "video unavailable" error, try next client immediately
-                    if "no longer supported" in stderr_str.lower() or "video is unavailable" in stderr_str.lower():
+                    if ("no longer supported" in stderr_str.lower() 
+                        or "video is unavailable" in stderr_str.lower()
+                        or "no longer supported in this application or device" in stderr_str.lower()):
                         continue
                     
                 except Exception as e:
@@ -491,6 +526,7 @@ class YouTubeStreamer:
         # Use explicit format IDs that work without Deno (from --list-formats)
         # These are video+audio combinations that don't require n-challenge solving
         # Also include m3u8 formats which work without n-challenge
+        # Added more format combinations for better compatibility
         formats = [
             quality,
             "137+140",  # 1080p video + audio
@@ -499,12 +535,26 @@ class YouTubeStreamer:
             "134+140",  # 360p video + audio
             "133+140",  # 240p video + audio
             "160+140",  # 144p video + audio
+            # Additional format combinations (from yt-dlp --list-formats)
+            "248+140",  # 1080p VP9 video + audio
+            "247+140",  # 720p VP9 video + audio
+            "244+140",  # 480p VP9 video + audio
+            "243+140",  # 360p VP9 video + audio
+            "242+140",  # 240p VP9 video + audio
+            "278+140",  # 144p VP9 video + audio
             # m3u8/HLS formats (work without n-challenge)
             "232+140",  # 720p m3u8 video + audio
             "231+140",  # 480p m3u8 video + audio
             "230+140",  # 360p m3u8 video + audio
             "229+140",  # 240p m3u8 video + audio
             "269+140",  # 144p m3u8 video + audio
+            # More m3u8 formats
+            "298+140",  # 1080p m3u8 video + audio
+            "299+140",  # 720p m3u8 video + audio
+            "300+140",  # 480p m3u8 video + audio
+            "301+140",  # 360p m3u8 video + audio
+            "302+140",  # 240p m3u8 video + audio
+            "303+140",  # 144p m3u8 video + audio
             "best[ext=mp4]/best",
             "best[protocol^=https]/best",
             "best[protocol^=m3u8]/best",
@@ -577,6 +627,7 @@ class YouTubeStreamer:
                         logger.warning("Format %s (client: %s, cookies: %s) failed: %s", fmt, player_client, use_cookies, stderr_str)
                         
                         # Detect invalid cookies - stop using them
+                        # NOTE: "requested format is not available" is a FORMAT issue, not a cookie issue
                         if ("sign in to confirm" in stderr_str.lower() 
                             or "not a bot" in stderr_str.lower() 
                             or "please sign in" in stderr_str.lower()
@@ -590,7 +641,9 @@ class YouTubeStreamer:
                             logger.warning("Cookies appear invalid (bot detection or format error), cleared cookies and will skip cookie attempts")
                         
                         # If "no longer supported" or "video unavailable" error, try next client immediately
-                        if "no longer supported" in stderr_str.lower() or "video is unavailable" in stderr_str.lower():
+                        if ("no longer supported" in stderr_str.lower() 
+                            or "video is unavailable" in stderr_str.lower()
+                            or "no longer supported in this application or device" in stderr_str.lower()):
                             break  # break format loop, try next client
                         
                         # If format not available, try next format
@@ -599,6 +652,81 @@ class YouTubeStreamer:
                         
                     except Exception as e:
                         logger.warning("Format %s (client: %s, cookies: %s) exception: %s", fmt, player_client, use_cookies, e)
+        
+        # Last resort: try without any explicit format (let yt-dlp pick best available)
+        # This handles SABR-only videos when Deno is not available
+        logger.info("All explicit formats failed, trying without format specification (let yt-dlp auto-select)...")
+        for player_client in player_clients:
+            for use_cookies in [True, False]:
+                if not use_cookies:
+                    logger.info("Trying auto-format without cookies...")
+                
+                cmd, env = self._get_base_cmd()
+                
+                # Remove cookies if not using them OR if cookies are invalid
+                if not use_cookies or self._cookies_invalidated:
+                    try:
+                        idx = cmd.index("--cookies")
+                        cmd.pop(idx)
+                        cmd.pop(idx)
+                    except ValueError:
+                        pass
+                
+                if player_client == "default":
+                    try:
+                        idx = cmd.index("--extractor-args")
+                        cmd.pop(idx)
+                        cmd.pop(idx)
+                    except ValueError:
+                        pass
+                else:
+                    try:
+                        idx = cmd.index("--extractor-args")
+                        cmd[idx+1] = f"youtube:player_client={player_client}"
+                    except ValueError:
+                        cmd.extend(["--extractor-args", f"youtube:player_client={player_client}"])
+                
+                # No -f flag - let yt-dlp pick the best available format
+                cmd.extend(["-g", url])
+                
+                try:
+                    proc = await asyncio.create_subprocess_exec(
+                        *cmd,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        env=env
+                    )
+                    try:
+                        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60.0)
+                    except asyncio.TimeoutError:
+                        proc.kill()
+                        await proc.communicate()
+                        logger.warning("Auto-format (client: %s, cookies: %s) timeout", player_client, use_cookies)
+                        continue
+                    
+                    if proc.returncode == 0:
+                        urls = stdout.decode().strip().split('\n')
+                        if urls and urls[0]:
+                            logger.info("Got stream URL with auto-format (player_client: %s, cookies: %s)", player_client, use_cookies)
+                            self._cleanup_cookies()
+                            return urls[0]
+                    
+                    stderr_str = stderr.decode()[:300]
+                    logger.warning("Auto-format (client: %s, cookies: %s) failed: %s", player_client, use_cookies, stderr_str)
+                    
+                    # Detect invalid cookies
+                    if ("sign in to confirm" in stderr_str.lower() 
+                        or "not a bot" in stderr_str.lower() 
+                        or "please sign in" in stderr_str.lower()
+                        or "skipping cookie file entry due to invalid length" in stderr_str.lower()):
+                        self._cookies_invalidated = True
+                        self.cookie_content = None
+                        self.cookie_file = None
+                        self._cleanup_cookies()
+                        logger.warning("Cookies appear invalid, cleared cookies")
+                    
+                except Exception as e:
+                    logger.warning("Auto-format (client: %s, cookies: %s) exception: %s", player_client, use_cookies, e)
         
         self._cleanup_cookies()
         # Provide more context about the failure

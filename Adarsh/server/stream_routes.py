@@ -6,6 +6,7 @@ import re
 from urllib.parse import quote, unquote
 
 from aiohttp import web
+from aiohttp.client_exceptions import ClientConnectionResetError
 from telethon.errors import AuthKeyUnregisteredError
 
 from Adarsh.bot import multi_clients, work_loads
@@ -145,56 +146,28 @@ async def media_streamer(request):
                 status=503
             )
 
-        # Wait for at least one client to be connected (max 30s)
-        max_wait = 30
-        wait_interval = 1.0
-        waited = 0
-        connected = False
-        
-        while waited < max_wait:
-            for idx, client in multi_clients.items():
-                if client.is_connected():
-                    connected = True
-                    break
-            if connected:
-                break
-            await asyncio.sleep(wait_interval)
-            waited += wait_interval
-        
-        if not connected:
-            logger.warning("No Telegram clients connected after %ss, trying YouTube fallback", max_wait)
-            # Try YouTube fallback immediately if bot not connected
-            if youtube_id_param and is_youtube_url(youtube_id_param):
-                youtube_id = extract_youtube_id(youtube_id_param)
-                youtube_url = f"https://www.youtube.com/watch?v={youtube_id}"
-                return await stream_youtube_video(request, youtube_url, youtube_id)
-            return web.Response(
-                text="Telegram bot not connected yet, please retry in a moment",
-                status=503,
-                headers={"Retry-After": "30"}
-            )
-
         # Select the client with the lowest current workload.
         index = min(
             multi_clients.keys(),
             key=lambda client_index: work_loads.get(client_index, 0)
         )
 
-        # Ensure selected client is connected
+        # Check if selected client is connected, find any connected client
         if not multi_clients[index].is_connected():
-            # Find any connected client
             for idx, client in multi_clients.items():
                 if client.is_connected():
                     index = idx
                     break
             else:
+                logger.warning("No Telegram clients connected, trying YouTube fallback")
                 if youtube_id_param and is_youtube_url(youtube_id_param):
                     youtube_id = extract_youtube_id(youtube_id_param)
                     youtube_url = f"https://www.youtube.com/watch?v={youtube_id}"
                     return await stream_youtube_video(request, youtube_url, youtube_id)
                 return web.Response(
-                    text="No connected Telegram clients available",
-                    status=503
+                    text="Telegram bot not connected, please retry in a moment",
+                    status=503,
+                    headers={"Retry-After": "30"}
                 )
 
         streamer = get_streamer(index)
@@ -204,6 +177,12 @@ async def media_streamer(request):
             file_properties = await streamer.get_file_properties(file_id)
         except AuthKeyUnregisteredError:
             logger.error("AuthKeyUnregisteredError - Telegram session expired, bot needs re-authentication")
+            # Clean up expired session files so next retry creates fresh session
+            try:
+                from Adarsh.bot.clients import cleanup_session_files
+                cleanup_session_files()
+            except Exception:
+                pass
             # Try YouTube fallback immediately
             if youtube_id_param and is_youtube_url(youtube_id_param):
                 logger.info("Falling back to YouTube due to expired session: %s", youtube_id_param)
@@ -233,7 +212,7 @@ async def media_streamer(request):
             )
 
         file_name = (
-            request.match_info.get("file_name")
+            unquote(request.match_info.get("file_name", "")).replace("+", " ")
             or file_properties.file_name
             or f"file_{file_id}"
         )
@@ -307,7 +286,7 @@ async def media_streamer(request):
 
         # Ask ByteStreamer for the requested Telegram chunks.
         body = streamer.yield_file(
-            file_properties=file_properties,
+            file_id=file_properties,
             index=index,
             offset=offset,
             first_part_cut=first_part_cut,
@@ -344,12 +323,12 @@ async def media_streamer(request):
                     content_length
                 )
 
-        except (ConnectionResetError, asyncio.CancelledError):
+        except (ConnectionResetError, asyncio.CancelledError, ClientConnectionResetError):
             logger.info(
                 "Client disconnected while streaming file %s",
                 file_id
             )
-            raise
+            return response
 
         finally:
             await body.aclose()
@@ -514,6 +493,11 @@ routes = [
     web.get("/ready", readiness_check),
     web.get("/watch/{id}/{file_name}", media_streamer),
     web.get("/dl/{id}/{file_name}", media_streamer),
+    # Handle double-slash URLs (e.g., //watch/...)
+    web.get("//watch/{id}/{file_name}", media_streamer),
+    web.get("//dl/{id}/{file_name}", media_streamer),
     web.options("/watch/{id}/{file_name}", options_handler),
     web.options("/dl/{id}/{file_name}", options_handler),
+    web.options("//watch/{id}/{file_name}", options_handler),
+    web.options("//dl/{id}/{file_name}", options_handler),
 ]

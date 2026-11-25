@@ -13,6 +13,8 @@ from telethon.errors import AuthKeyUnregisteredError
 
 from Adarsh.server.exceptions import FIleNotFound
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class FileProperties:
@@ -36,16 +38,16 @@ def get_media_from_message(message):
     if not message:
         return None
 
-    document = getattr(message, "document", None)
+    # Check all media types in order of preference
+    for attr in ("document", "video", "audio", "animation", "voice", "video_note", "sticker", "photo"):
+        media = getattr(message, attr, None)
+        if media:
+            logger.info("get_media_from_message: found media attr=%s, type=%s", attr, type(media).__name__)
+            return media
 
-    if isinstance(document, Document):
-        return document
-
-    photo = getattr(message, "photo", None)
-
-    if isinstance(photo, Photo):
-        return photo
-
+    # Debug: log all message attributes to find media
+    attrs = [a for a in dir(message) if not a.startswith('_')]
+    logger.warning("get_media_from_message: NO MEDIA FOUND. Message attrs: %s", attrs)
     return None
 
 
@@ -82,17 +84,21 @@ async def get_file_ids(
 ) -> Optional[FileProperties]:
 
     try:
+        logger.info("get_file_ids: fetching message id=%s from chat_id=%s", id, chat_id)
         message = await client.get_messages(
             chat_id,
             ids=id
         )
 
         if not message:
+            logger.warning("get_file_ids: message NOT FOUND id=%s in chat_id=%s", id, chat_id)
             raise FIleNotFound
 
+        logger.info("get_file_ids: message FOUND id=%s, chat_id=%s, type=%s", message.id, getattr(message, 'chat_id', 'unknown'), type(message).__name__)
         media = get_media_from_message(message)
 
         if not media:
+            logger.warning("get_file_ids: NO MEDIA in message id=%s", message.id)
             raise FIleNotFound
 
         file_info = message.file
@@ -118,14 +124,6 @@ async def get_file_ids(
             message,
             media
         )
-    except AuthKeyUnregisteredError:
-        logging.error("AuthKeyUnregisteredError in get_file_ids - session expired")
-        raise
-    except Exception as e:
-        if "AuthKeyUnregistered" in str(e) or "key is not registered" in str(e).lower():
-            logging.error("AuthKeyUnregisteredError detected in get_file_ids: %s", e)
-            raise AuthKeyUnregisteredError("Session expired") from e
-        raise
 
         if not file_size:
             logging.warning(
@@ -142,10 +140,15 @@ async def get_file_ids(
             unique_id=unique_id
         )
 
+    except AuthKeyUnregisteredError:
+        logging.error("AuthKeyUnregisteredError in get_file_ids - session expired")
+        raise
     except FIleNotFound:
         raise
-
-    except Exception:
+    except Exception as e:
+        if "AuthKeyUnregistered" in str(e) or "key is not registered" in str(e).lower():
+            logging.error("AuthKeyUnregisteredError detected in get_file_ids: %s", e)
+            raise AuthKeyUnregisteredError("Session expired") from e
         logging.exception(
             "Unable to retrieve file properties for message %s",
             id

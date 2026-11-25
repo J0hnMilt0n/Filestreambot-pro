@@ -7,7 +7,7 @@ import os
 
 from telethon import TelegramClient
 from telethon.sessions import MemorySession
-from telethon.errors import RpcCallFailError, AuthKeyUnregisteredError
+from telethon.errors import RpcCallFailError, AuthKeyUnregisteredError, FloodWaitError
 import TelethonFakeTLS
 
 # Monkey-patch TelethonFakeTLS to add missing wait_closed method
@@ -76,7 +76,6 @@ def is_telegram_internal_error(error):
         "internal issues",
         "try again later",
         "rpc call fail",
-        "importbotauthorizationrequest",
     ]):
         return True
     return False
@@ -90,6 +89,20 @@ def is_auth_key_error(error):
     if "authkeyunregistered" in error_msg or "key is not registered" in error_msg:
         return True
     return False
+
+
+def is_flood_wait_error(error):
+    """Check if the error is a FloodWaitError and return wait time in seconds."""
+    if isinstance(error, FloodWaitError):
+        return error.seconds
+    error_msg = str(error).lower()
+    if "floodwait" in error_msg or "a wait of" in error_msg:
+        # Try to extract wait time from message like "A wait of 2979 seconds is required"
+        import re
+        match = re.search(r'wait of (\d+) seconds?', error_msg)
+        if match:
+            return int(match.group(1))
+    return None
 
 
 def cleanup_session_files():
@@ -116,6 +129,7 @@ async def initialize_clients():
 
     # Start main bot with proxy fallback
     global StreamBot
+    import sys
     from Adarsh.bot import StreamBot as BotInstance
     
     # Try with proxy first, then direct connection
@@ -126,6 +140,8 @@ async def initialize_clients():
         # Recreate StreamBot with appropriate connection
         StreamBot = create_client(MemorySession(), use_proxy=use_proxy)
         multi_clients[0] = StreamBot
+        # Update module-level reference so all imports see the new client
+        sys.modules['Adarsh.bot'].StreamBot = StreamBot
         
         try:
             logging.info("Starting main bot (proxy=%s)...", use_proxy)
@@ -147,6 +163,20 @@ async def initialize_clients():
                 StreamBot = create_client(MemorySession(), use_proxy=use_proxy)
                 multi_clients[0] = StreamBot
                 continue  # Retry with same proxy setting
+            
+            # Handle FloodWaitError - wait for required time
+            wait_time = is_flood_wait_error(e)
+            if wait_time:
+                logging.warning("FloodWaitError: waiting %ss before retry...", wait_time)
+                try:
+                    await StreamBot.disconnect()
+                except Exception:
+                    pass
+                await asyncio.sleep(wait_time)
+                # Retry with same proxy setting
+                StreamBot = create_client(MemorySession(), use_proxy=use_proxy)
+                multi_clients[0] = StreamBot
+                continue
             
             try:
                 await StreamBot.disconnect()
@@ -193,6 +223,20 @@ async def initialize_clients():
                     logging.warning("Client %s: AuthKeyUnregisteredError detected, cleaning up session files...", client_id)
                     cleanup_session_files()
                 
+                # Handle FloodWaitError for additional clients
+                wait_time = is_flood_wait_error(e)
+                if wait_time:
+                    logging.warning("Client %s: FloodWaitError: waiting %ss before retry...", client_id, wait_time)
+                    if client is not None:
+                        try:
+                            await client.disconnect()
+                        except Exception:
+                            pass
+                    await asyncio.sleep(wait_time)
+                    # Retry with same proxy setting
+                    client = create_client(MemorySession(), use_proxy=use_proxy)
+                    continue
+                
                 if client is not None:
                     try:
                         await client.disconnect()
@@ -210,3 +254,23 @@ async def initialize_clients():
         "Multi-client mode: %s",
         "enabled" if started else "disabled"
     )
+
+    # Create Pyrogram client for bot commands (plugins)
+    # This runs alongside Telethon for streaming
+    try:
+        from pyrogram import Client as PyrogramClient
+        PyroBot = PyrogramClient(
+            "pyro_bot",
+            api_id=Var.API_ID,
+            api_hash=Var.API_HASH,
+            bot_token=Var.BOT_TOKEN,
+            workers=Var.WORKERS,
+            sleep_threshold=Var.SLEEP_THRESHOLD,
+            no_updates=True  # We only need it for sending messages, not receiving
+        )
+        # Store in multi_clients for plugin access
+        multi_clients["pyro"] = PyroBot
+        logging.info("Pyrogram client created for bot commands")
+    except Exception as e:
+        logging.warning("Failed to create Pyrogram client: %s", e)
+        PyroBot = None

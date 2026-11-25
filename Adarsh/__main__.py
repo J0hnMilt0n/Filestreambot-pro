@@ -90,11 +90,11 @@ async def load_plugins():
             print(f"Imported => {plugin_name}")
 
         except Exception:
-            logging.exception(
-                "Failed to load plugin: %s",
-                plugin_name
+            logging.warning(
+                "Plugin loading failed (non-fatal): %s",
+                plugin_name,
+                exc_info=True
             )
-            raise
 
     print("------------------------------ DONE ------------------------------")
 
@@ -170,13 +170,29 @@ async def start_services():
                     
                     await initialize_clients()
                     
+                    # Get updated StreamBot reference after initialization
+                    from .bot import StreamBot as UpdatedStreamBot
+                    
                     # Verify bot is working
-                    bot_info = await StreamBot.get_me()
-                    StreamBot.username = bot_info.username
+                    bot_info = await UpdatedStreamBot.get_me()
+                    UpdatedStreamBot.username = bot_info.username
                     logging.info("Bot health check passed: @%s", bot_info.username)
                     
-                    # Initialize plugins after successful bot connection
-                    await load_plugins()
+                    # Start Pyrogram client for bot commands (plugins)
+                    try:
+                        from .bot import multi_clients
+                        PyroBot = multi_clients.get("pyro")
+                        if PyroBot:
+                            await PyroBot.start()
+                            logging.info("Pyrogram client started for bot commands")
+                    except Exception as e:
+                        logging.warning("Failed to start Pyrogram client: %s", e)
+                    
+                    # Initialize plugins after successful bot connection (non-blocking)
+                    try:
+                        await load_plugins()
+                    except Exception as e:
+                        logging.warning("Plugin loading failed (non-fatal): %s", e)
                     
                     print("------------------------------ DONE ------------------------------")
                     print()
@@ -189,7 +205,7 @@ async def start_services():
                     logging.warning("Main bot startup failed (attempt %s): %s", attempt, e)
                     
                     try:
-                        await StreamBot.disconnect()
+                        await UpdatedStreamBot.disconnect()
                     except Exception:
                         pass
                     

@@ -13,6 +13,8 @@ from Adarsh.bot import work_loads
 from Adarsh.server.exceptions import FIleNotFound
 from Adarsh.vars import Var
 
+logger = logging.getLogger(__name__)
+
 from .file_properties import (
     FileProperties,
     get_file_ids
@@ -53,6 +55,7 @@ class ByteStreamer:
         id: int
     ) -> FileProperties:
 
+        logger.info("ByteStreamer.generate_file_properties: id=%s, BIN_CHANNEL=%s", id, Var.BIN_CHANNEL)
         file_properties = await get_file_ids(
             self.client,
             Var.BIN_CHANNEL,
