@@ -411,7 +411,8 @@ class YouTubeStreamer:
                         env=env
                     )
                     try:
-                        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60.0)
+                        # Reduced timeout from 60s to 30s for faster fallback
+                        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30.0)
                     except asyncio.TimeoutError:
                         proc.kill()
                         await proc.communicate()
@@ -488,7 +489,8 @@ class YouTubeStreamer:
                 env=env
             )
             try:
-                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60.0)
+                # Reduced timeout from 60s to 30s for faster fallback
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30.0)
             except asyncio.TimeoutError:
                 proc.kill()
                 await proc.communicate()
@@ -584,7 +586,16 @@ class YouTubeStreamer:
             if not use_cookies:
                 logger.info("Trying stream URL without cookies...")
             
+            # If cookies were invalidated in previous iteration, skip cookie attempt entirely
+            if use_cookies and self._cookies_invalidated:
+                logger.info("Cookies invalidated, skipping cookie attempt")
+                continue
+            
             for player_client in player_clients:
+                # If cookies invalidated during this client's formats, break to next client (or no-cookie attempt)
+                if self._cookies_invalidated and use_cookies:
+                    break
+                    
                 for fmt in formats:
                     cmd, env = self._get_base_cmd()
                     
@@ -624,7 +635,8 @@ class YouTubeStreamer:
                             env=env
                         )
                         try:
-                            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60.0)
+                            # Reduced timeout from 60s to 30s for faster fallback
+                            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30.0)
                         except asyncio.TimeoutError:
                             proc.kill()
                             await proc.communicate()
@@ -654,6 +666,8 @@ class YouTubeStreamer:
                             self.cookie_file = None
                             self._cleanup_cookies()
                             logger.warning("Cookies appear invalid (bot detection or format error), cleared cookies and will skip cookie attempts")
+                            # Break out of format loop immediately - cookies are invalid
+                            break
                         
                         # If "no longer supported" or "video unavailable" error, try next client immediately
                         if ("no longer supported" in stderr_str.lower() 
@@ -677,72 +691,78 @@ class YouTubeStreamer:
                     if not use_cookies:
                         logger.info("Trying auto-format without cookies...")
                     
-                    cmd, env = self._get_base_cmd()
-                
-                # Remove cookies if not using them OR if cookies are invalid
-                if not use_cookies or self._cookies_invalidated:
-                    try:
-                        idx = cmd.index("--cookies")
-                        cmd.pop(idx)
-                        cmd.pop(idx)
-                    except ValueError:
-                        pass
-                
-                if player_client == "default":
-                    try:
-                        idx = cmd.index("--extractor-args")
-                        cmd.pop(idx)
-                        cmd.pop(idx)
-                    except ValueError:
-                        pass
-                else:
-                    try:
-                        idx = cmd.index("--extractor-args")
-                        cmd[idx+1] = f"youtube:player_client={player_client}"
-                    except ValueError:
-                        cmd.extend(["--extractor-args", f"youtube:player_client={player_client}"])
-                
-                # No -f flag - let yt-dlp pick the best available format
-                cmd.extend(["-g", url])
-                
-                try:
-                    proc = await asyncio.create_subprocess_exec(
-                        *cmd,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE,
-                        env=env
-                    )
-                    try:
-                        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60.0)
-                    except asyncio.TimeoutError:
-                        proc.kill()
-                        await proc.communicate()
-                        logger.warning("Auto-format (client: %s, cookies: %s) timeout", player_client, use_cookies)
+                    # If cookies were invalidated, skip cookie attempt
+                    if use_cookies and self._cookies_invalidated:
+                        logger.info("Cookies invalidated, skipping cookie attempt")
                         continue
                     
-                    if proc.returncode == 0:
-                        urls = stdout.decode().strip().split('\n')
-                        if urls and urls[0]:
-                            logger.info("Got stream URL with auto-format (player_client: %s, cookies: %s)", player_client, use_cookies)
+                    cmd, env = self._get_base_cmd()
+                
+                    # Remove cookies if not using them OR if cookies are invalid
+                    if not use_cookies or self._cookies_invalidated:
+                        try:
+                            idx = cmd.index("--cookies")
+                            cmd.pop(idx)
+                            cmd.pop(idx)
+                        except ValueError:
+                            pass
+                    
+                    if player_client == "default":
+                        try:
+                            idx = cmd.index("--extractor-args")
+                            cmd.pop(idx)
+                            cmd.pop(idx)
+                        except ValueError:
+                            pass
+                    else:
+                        try:
+                            idx = cmd.index("--extractor-args")
+                            cmd[idx+1] = f"youtube:player_client={player_client}"
+                        except ValueError:
+                            cmd.extend(["--extractor-args", f"youtube:player_client={player_client}"])
+                    
+                    # No -f flag - let yt-dlp pick the best available format
+                    cmd.extend(["-g", url])
+                    
+                    try:
+                        proc = await asyncio.create_subprocess_exec(
+                            *cmd,
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE,
+                            env=env
+                        )
+                        try:
+                            # Reduced timeout from 60s to 30s for faster fallback
+                            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30.0)
+                        except asyncio.TimeoutError:
+                            proc.kill()
+                            await proc.communicate()
+                            logger.warning("Auto-format (client: %s, cookies: %s) timeout", player_client, use_cookies)
+                            continue
+                        
+                        if proc.returncode == 0:
+                            urls = stdout.decode().strip().split('\n')
+                            if urls and urls[0]:
+                                logger.info("Got stream URL with auto-format (player_client: %s, cookies: %s)", player_client, use_cookies)
+                                self._cleanup_cookies()
+                                return urls[0]
+                        
+                        stderr_str = stderr.decode()[:300]
+                        logger.warning("Auto-format (client: %s, cookies: %s) failed: %s", player_client, use_cookies, stderr_str)
+                        
+                        # Detect invalid cookies
+                        if ("sign in to confirm" in stderr_str.lower() 
+                            or "not a bot" in stderr_str.lower() 
+                            or "please sign in" in stderr_str.lower()
+                            or "skipping cookie file entry due to invalid length" in stderr_str.lower()):
+                            self._cookies_invalidated = True
+                            self.cookie_content = None
+                            self.cookie_file = None
                             self._cleanup_cookies()
-                            return urls[0]
+                            logger.warning("Cookies appear invalid, cleared cookies")
                     
-                    stderr_str = stderr.decode()[:300]
-                    logger.warning("Auto-format (client: %s, cookies: %s) failed: %s", player_client, use_cookies, stderr_str)
-                    
-                    # Detect invalid cookies
-                    if ("sign in to confirm" in stderr_str.lower() 
-                        or "not a bot" in stderr_str.lower() 
-                        or "please sign in" in stderr_str.lower()
-                        or "skipping cookie file entry due to invalid length" in stderr_str.lower()):
-                        self._cookies_invalidated = True
-                        self.cookie_content = None
-                        self.cookie_file = None
-                        self._cleanup_cookies()
-                        logger.warning("Cookies appear invalid, cleared cookies")
-                    
-                except Exception as e:
-                    logger.warning("Auto-format (client: %s, cookies: %s) exception: %s", player_client, use_cookies, e)
+                    except Exception as e:
+                        logger.warning("Auto-format (client: %s, cookies: %s) exception: %s", player_client, use_cookies, e)
         
         except Exception as e:
             logger.error("Auto-format fallback failed with exception: %s", e)

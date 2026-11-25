@@ -150,20 +150,35 @@ async def media_streamer(request):
                 status=503
             )
 
-        # Select the client with the lowest current workload.
+        # Filter out non-Telethon clients (like "pyro" Pyrogram client) for streaming
+        telethon_clients = {k: v for k, v in multi_clients.items() if isinstance(k, int)}
+        
+        if not telethon_clients:
+            logger.warning("No Telethon clients available for streaming")
+            if youtube_id_param and is_youtube_url(youtube_id_param):
+                youtube_id = extract_youtube_id(youtube_id_param)
+                youtube_url = f"https://www.youtube.com/watch?v={youtube_id}"
+                return await stream_youtube_video(request, youtube_url, youtube_id)
+            return web.Response(
+                text="Telegram clients not ready, please retry in a moment",
+                status=503,
+                headers={"Retry-After": "30"}
+            )
+
+        # Select the client with the lowest current workload (only Telethon clients)
         index = min(
-            multi_clients.keys(),
+            telethon_clients.keys(),
             key=lambda client_index: work_loads.get(client_index, 0)
         )
 
-        # Check if selected client is connected, find any connected client
-        if not multi_clients[index].is_connected():
-            for idx, client in multi_clients.items():
+        # Check if selected client is connected, find any connected Telethon client
+        if not telethon_clients[index].is_connected():
+            for idx, client in telethon_clients.items():
                 if client.is_connected():
                     index = idx
                     break
             else:
-                logger.warning("No Telegram clients connected, trying YouTube fallback")
+                logger.warning("No Telethon clients connected, trying YouTube fallback")
                 if youtube_id_param and is_youtube_url(youtube_id_param):
                     youtube_id = extract_youtube_id(youtube_id_param)
                     youtube_url = f"https://www.youtube.com/watch?v={youtube_id}"
