@@ -681,6 +681,12 @@ class YouTubeStreamer:
                         
                     except Exception as e:
                         logger.warning("Format %s (client: %s, cookies: %s) exception: %s", fmt, player_client, use_cookies, e)
+                
+                # After format loop: if cookies were invalidated, break player_client loop too
+                # This ensures we don't continue trying other clients with invalid cookies
+                if self._cookies_invalidated and use_cookies:
+                    logger.info("Cookies invalidated, breaking out of player_client loop")
+                    break
         
         # Last resort: try without any explicit format (let yt-dlp pick best available)
         # This handles SABR-only videos when Deno is not available
@@ -763,6 +769,11 @@ class YouTubeStreamer:
                     
                     except Exception as e:
                         logger.warning("Auto-format (client: %s, cookies: %s) exception: %s", player_client, use_cookies, e)
+                
+                # After use_cookies loop: if cookies were invalidated, break player_client loop too
+                if self._cookies_invalidated and use_cookies:
+                    logger.info("Cookies invalidated, breaking out of player_client loop (auto-format)")
+                    break
         
         except Exception as e:
             logger.error("Auto-format fallback failed with exception: %s", e)
