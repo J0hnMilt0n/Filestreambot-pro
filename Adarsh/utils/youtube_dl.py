@@ -33,6 +33,8 @@ class YouTubeStreamer:
         self._cookies_invalidated = False
         # Cache for video info to avoid duplicate calls
         self._info_cache: Dict[str, Dict[str, Any]] = {}
+        # Cache for stream URLs to avoid re-extraction on seeks
+        self._stream_url_cache: Dict[str, str] = {}
         # Track Invidious failures to skip if consistently failing
         self._invidious_failures = 0
         self._invidious_skip_threshold = 3  # Skip Invidious after 3 consecutive failures
@@ -443,6 +445,8 @@ class YouTubeStreamer:
                         self.cookie_content = None
                         # Also invalidate cookie file path so it won't be used again
                         self.cookie_file = None
+                        # Clear stream URL cache since cookies changed
+                        self._stream_url_cache.clear()
                         self._cleanup_cookies()
                         logger.warning("Cookies appear invalid (bot detection or format error), cleared cookies and will skip cookie attempts")
                     
@@ -519,10 +523,17 @@ class YouTubeStreamer:
         """Get direct stream URL. Try Invidious FIRST (fast), then yt-dlp as fallback."""
         video_id = self._extract_video_id(url)
         
+        # Check stream URL cache first
+        cache_key = f"{video_id}:{quality}"
+        if cache_key in self._stream_url_cache:
+            logger.info("Using cached stream URL for %s", video_id)
+            return self._stream_url_cache[cache_key]
+        
         # Try Invidious FIRST (fast, no yt-dlp subprocess)
         logger.info("Trying Invidious for stream URL: %s", video_id)
         stream_url = await self._get_invidious_stream_url(video_id)
         if stream_url:
+            self._stream_url_cache[cache_key] = stream_url
             self._cleanup_cookies()
             return stream_url
         
@@ -647,6 +658,7 @@ class YouTubeStreamer:
                             urls = stdout.decode().strip().split('\n')
                             if urls and urls[0]:
                                 logger.info("Got stream URL with format: %s (player_client: %s, cookies: %s)", fmt, player_client, use_cookies)
+                                self._stream_url_cache[cache_key] = urls[0]
                                 self._cleanup_cookies()
                                 return urls[0]
                         
@@ -664,6 +676,8 @@ class YouTubeStreamer:
                             self.cookie_content = None
                             # Also invalidate cookie file path so it won't be used again
                             self.cookie_file = None
+                            # Clear stream URL cache since cookies changed
+                            self._stream_url_cache.clear()
                             self._cleanup_cookies()
                             logger.warning("Cookies appear invalid (bot detection or format error), cleared cookies and will skip cookie attempts")
                             # Break out of format loop immediately - cookies are invalid
@@ -750,6 +764,7 @@ class YouTubeStreamer:
                             urls = stdout.decode().strip().split('\n')
                             if urls and urls[0]:
                                 logger.info("Got stream URL with auto-format (player_client: %s, cookies: %s)", player_client, use_cookies)
+                                self._stream_url_cache[cache_key] = urls[0]
                                 self._cleanup_cookies()
                                 return urls[0]
                         
@@ -764,6 +779,8 @@ class YouTubeStreamer:
                             self._cookies_invalidated = True
                             self.cookie_content = None
                             self.cookie_file = None
+                            # Clear stream URL cache since cookies changed
+                            self._stream_url_cache.clear()
                             self._cleanup_cookies()
                             logger.warning("Cookies appear invalid, cleared cookies")
                     

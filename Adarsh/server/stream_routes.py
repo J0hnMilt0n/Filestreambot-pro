@@ -431,12 +431,28 @@ async def stream_youtube_video(request, youtube_url: str, video_id: str, start_s
             estimated_bitrate = 1_000_000  # ~8 Mbps
             start_bytes = int(start_seconds * estimated_bitrate)
 
-        # Get stream URL first to determine content length (for Content-Range)
+        # Get video info from cache (includes content length from formats)
+        # This avoids making a HEAD request for each Range request
+        video_info = await yt_streamer.get_video_info(youtube_url)
+        
+        # Get stream URL
         stream_url = await yt_streamer.get_stream_url(youtube_url)
         if not stream_url:
             return web.Response(text="No stream URL found", status=500)
 
-        # Prepare headers for upstream request to get content length
+        # Determine content length from cached video info
+        content_length = None
+        if video_info and video_info.get("formats"):
+            # Find the format that matches our stream URL
+            for fmt in video_info["formats"]:
+                if fmt.get("url") == stream_url or (fmt.get("manifest_url") and fmt["manifest_url"] == stream_url):
+                    content_length = fmt.get("filesize") or fmt.get("filesize_approx")
+                    break
+            # If not found, use the first format's size as approximation
+            if content_length is None and video_info["formats"]:
+                content_length = video_info["formats"][0].get("filesize") or video_info["formats"][0].get("filesize_approx")
+
+        # Prepare headers for upstream request
         import aiohttp
         headers_upstream = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -460,23 +476,23 @@ async def stream_youtube_video(request, youtube_url: str, video_id: str, start_s
         timeout = aiohttp.ClientTimeout(total=300, connect=30, sock_read=30)
         connector = aiohttp.TCPConnector(limit=10)
         
-        # First, make a HEAD request to get content length
-        content_length = None
-        async with aiohttp.ClientSession(timeout=timeout, connector=connector, cookie_jar=cookie_jar) as session:
-            async with session.head(stream_url, headers=headers_upstream) as resp:
-                if resp.status in (200, 206):
-                    cl = resp.headers.get("Content-Length")
-                    if cl:
-                        content_length = int(cl)
-                    # Also check Content-Range for total size
-                    cr = resp.headers.get("Content-Range")
-                    if cr and "/" in cr:
-                        try:
-                            total_size = int(cr.split("/")[-1])
-                            if content_length is None:
-                                content_length = total_size
-                        except (ValueError, IndexError):
-                            pass
+        # If we don't have content_length from cache, make a HEAD request (first time only)
+        if content_length is None:
+            async with aiohttp.ClientSession(timeout=timeout, connector=connector, cookie_jar=cookie_jar) as session:
+                async with session.head(stream_url, headers=headers_upstream) as resp:
+                    if resp.status in (200, 206):
+                        cl = resp.headers.get("Content-Length")
+                        if cl:
+                            content_length = int(cl)
+                        # Also check Content-Range for total size
+                        cr = resp.headers.get("Content-Range")
+                        if cr and "/" in cr:
+                            try:
+                                total_size = int(cr.split("/")[-1])
+                                if content_length is None:
+                                    content_length = total_size
+                            except (ValueError, IndexError):
+                                pass
 
         # Now prepare response headers
         response_headers = {
