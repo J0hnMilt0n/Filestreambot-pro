@@ -399,7 +399,7 @@ async def media_streamer(request):
 
 
 async def stream_youtube_video(request, youtube_url: str, video_id: str, start_seconds: float = None):
-    """Stream a YouTube video using yt-dlp.
+    """Stream a YouTube video using yt-dlp with full Range request support.
 
     IMPORTANT: Response headers are sent IMMEDIATELY (before the slow yt-dlp
     extraction) so Koyeb's load balancer doesn't return 502 while we wait
@@ -408,9 +408,78 @@ async def stream_youtube_video(request, youtube_url: str, video_id: str, start_s
     try:
         yt_streamer = await get_youtube_streamer()
 
-        # Send response headers IMMEDIATELY - no Content-Length (unknown size).
-        # This prevents Koyeb LB 502 timeouts during slow URL extraction.
-        headers = {
+        # Parse Range header from request for seeking support
+        range_header = request.headers.get("Range")
+        start_bytes = 0
+        end_bytes = None
+        
+        if range_header:
+            # Parse "bytes=start-end" format
+            try:
+                range_str = range_header.replace("bytes=", "")
+                if "-" in range_str:
+                    start_str, end_str = range_str.split("-", 1)
+                    if start_str:
+                        start_bytes = int(start_str)
+                    if end_str:
+                        end_bytes = int(end_str)
+            except (ValueError, IndexError):
+                logger.warning("Invalid Range header: %s", range_header)
+        
+        # Fallback to start_seconds query parameter if no Range header
+        if start_bytes == 0 and start_seconds is not None:
+            estimated_bitrate = 1_000_000  # ~8 Mbps
+            start_bytes = int(start_seconds * estimated_bitrate)
+
+        # Get stream URL first to determine content length (for Content-Range)
+        stream_url = await yt_streamer.get_stream_url(youtube_url)
+        if not stream_url:
+            return web.Response(text="No stream URL found", status=500)
+
+        # Prepare headers for upstream request to get content length
+        import aiohttp
+        headers_upstream = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Referer": "https://www.youtube.com/",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Origin": "https://www.youtube.com",
+        }
+        if start_bytes or end_bytes:
+            range_val = f"bytes={start_bytes}-"
+            if end_bytes:
+                range_val += str(end_bytes)
+            headers_upstream["Range"] = range_val
+
+        cookie_path = yt_streamer._prepare_cookies()
+        cookie_jar = None
+        if cookie_path:
+            import http.cookiejar
+            cookie_jar = http.cookiejar.MozillaCookieJar(cookie_path)
+            cookie_jar.load(ignore_discard=True, ignore_expires=True)
+
+        timeout = aiohttp.ClientTimeout(total=300, connect=30, sock_read=30)
+        connector = aiohttp.TCPConnector(limit=10)
+        
+        # First, make a HEAD request to get content length
+        content_length = None
+        async with aiohttp.ClientSession(timeout=timeout, connector=connector, cookie_jar=cookie_jar) as session:
+            async with session.head(stream_url, headers=headers_upstream) as resp:
+                if resp.status in (200, 206):
+                    cl = resp.headers.get("Content-Length")
+                    if cl:
+                        content_length = int(cl)
+                    # Also check Content-Range for total size
+                    cr = resp.headers.get("Content-Range")
+                    if cr and "/" in cr:
+                        try:
+                            total_size = int(cr.split("/")[-1])
+                            if content_length is None:
+                                content_length = total_size
+                        except (ValueError, IndexError):
+                            pass
+
+        # Now prepare response headers
+        response_headers = {
             "Content-Type": "video/mp4",
             "Accept-Ranges": "bytes",
             "Content-Disposition": f'inline; filename="youtube_{video_id}.mp4"',
@@ -423,22 +492,28 @@ async def stream_youtube_video(request, youtube_url: str, video_id: str, start_s
             "Access-Control-Expose-Headers": "Content-Length, Content-Range, Accept-Ranges",
         }
 
-        response = web.StreamResponse(status=200, headers=headers)
+        # Determine response status and Content-Range
+        if range_header and content_length:
+            # 206 Partial Content
+            response_status = 206
+            end_pos = end_bytes if end_bytes is not None else (content_length - 1)
+            response_headers["Content-Range"] = f"bytes {start_bytes}-{end_pos}/{content_length}"
+            response_headers["Content-Length"] = str(end_pos - start_bytes + 1)
+        else:
+            # 200 OK (full content or unknown size)
+            response_status = 200
+            if content_length:
+                response_headers["Content-Length"] = str(content_length)
+
+        response = web.StreamResponse(status=response_status, headers=response_headers)
         await response.prepare(request)
 
-        # Now do the slow extraction (Invidious + yt-dlp fallbacks).
-        # This can take minutes - but headers are already sent, so no 502.
+        # Now stream the actual content
         try:
-            # Convert start_seconds to start bytes (approximate)
-            start_bytes = 0
-            if start_seconds is not None:
-                estimated_bitrate = 1_000_000  # ~8 Mbps
-                start_bytes = int(start_seconds * estimated_bitrate)
-            
             stream_gen = yt_streamer.stream_video(
                 youtube_url,
                 start=start_bytes,
-                end=None,
+                end=end_bytes,
                 chunk_size=512 * 1024
             )
 
@@ -446,8 +521,6 @@ async def stream_youtube_video(request, youtube_url: str, video_id: str, start_s
             first_chunk = True
             while True:
                 try:
-                    # First chunk includes URL extraction time (Invidious + yt-dlp) - allow more time
-                    # Subsequent chunks are just network reads - shorter timeout
                     timeout = 120.0 if first_chunk else 30.0
                     chunk = await asyncio.wait_for(stream_gen.__anext__(), timeout=timeout)
                     first_chunk = False
@@ -474,7 +547,6 @@ async def stream_youtube_video(request, youtube_url: str, video_id: str, start_s
 
         except Exception as e:
             logger.exception("YouTube streaming failed for %s: %s", video_id, e)
-            # Headers already sent - can't change status. Write error as body.
             try:
                 await response.write(
                     f"YouTube streaming error: {type(e).__name__}: {e}".encode()
